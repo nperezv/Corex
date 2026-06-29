@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>COREX</title>
+  <link rel="icon" type="image/png" href="../assets/favicon.png" />
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <style>
+    /* IBM Plex Mono servida localmente — antes dependía de Google Fonts en
+       remoto, lo que fallaba silenciosamente en redes corporativas con
+       restricciones, cayendo a la monospace del sistema sin avisar. */
+    @font-face {
+      font-family: 'IBM Plex Mono';
+      font-style: normal;
+      font-weight: 100;
+      src: url('vendor/fonts/ibm-plex-mono-latin-100-normal.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'IBM Plex Mono';
+      font-style: normal;
+      font-weight: 400;
+      src: url('vendor/fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'IBM Plex Mono';
+      font-style: normal;
+      font-weight: 500;
+      src: url('vendor/fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'IBM Plex Mono';
+      font-style: normal;
+      font-weight: 600;
+      src: url('vendor/fonts/ibm-plex-mono-latin-600-normal.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'IBM Plex Mono';
+      font-style: normal;
+      font-weight: 700;
+      src: url('vendor/fonts/ibm-plex-mono-latin-700-normal.woff2') format('woff2');
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #app { height: 100%; background: #0a0b0d; color: #c8d0d8; font-family: 'IBM Plex Mono', monospace; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0b0d; }
+    ::-webkit-scrollbar-thumb { background: #22252a; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #2e3238; }
+    input, textarea, select, button { font-family: 'IBM Plex Mono', monospace; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/xterm-addon-fit.js"></script>
+  <script src="vendor/monaco/vs/loader.js"></script>
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
