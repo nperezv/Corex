@@ -11,30 +11,19 @@ let pty;
 try {
   pty = require('node-pty');
 } catch (e) {
-  // node-pty es un módulo nativo; si no está compilado para esta plataforma,
-  // CorexTerm degrada con un mensaje claro en vez de petar toda la app.
   pty = null;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Vault — almacenamiento cifrado único para AWX/Jira/SMTP/CorexTerm
-// ═══════════════════════════════════════════════════════════════════════════
-// Todo COREX se guarda como un solo blob cifrado (AES-256-GCM, clave derivada
-// con PBKDF2 de 200k iteraciones a partir de la Master Password). La Master
-// Password se pide al arrancar la app — antes de mostrar nada — y nunca se
-// guarda en disco, solo vive en memoria del proceso mientras la app está
-// abierta. Si se olvida, no hay recuperación posible: es la garantía de que
-// el cifrado es real y no una puerta trasera disfrazada.
 const VAULT_PATH = path.join(app.getPath('userData'), 'corex-vault.json');
 const LEGACY_CONFIG_PATH = path.join(app.getPath('userData'), 'corex-config.json'); // pre-vault, texto plano
-const LEGACY_SESSIONS_PATH = path.join(app.getPath('userData'), 'corex-sessions.json'); // pre-vault, cifrado por sesión
+const LEGACY_SESSIONS_PATH = path.join(app.getPath('userData'), 'corex-sessions.json'); // pre-vault, session-encrypted
 const PBKDF2_ITERATIONS = 200000;
 
-let vaultKeyCache = null; // Buffer de 32 bytes derivado de la Master Password, solo en memoria
-let vaultDataCache = null; // contenido descifrado del vault, solo en memoria mientras está unlocked
+let vaultKeyCache = null; // 32-byte buffer derived from the Master Password, memory only
+let vaultDataCache = null; // decrypted vault contents, only kept in memory while unlocked
 
 function defaultVaultData() {
-  return { jira: {}, awx: {}, smtp: {}, lang: 'en', ticketLinks: {}, favoriteTemplates: [], templateUsage: {}, ctSessions: [], ctMacros: [] };
+  return { jira: {}, awx: {}, smtp: {}, lang: 'en', ticketLinks: {}, automationProfiles: {}, favoriteTemplates: [], templateUsage: {}, ctSessions: [], ctMacros: [] };
 }
 
 function vaultExists() {
@@ -71,16 +60,12 @@ function persistVault() {
 
 let vaultSaltHex = null;
 
-// Primera vez: no existe vault. Esta contraseña se convierte en la Master
-// Password definitiva. Si hay config/sesiones del esquema viejo (pre-vault),
-// las migramos al vault cifrado en el mismo paso.
 function createVault(masterPassword) {
   const salt = crypto.randomBytes(16);
   vaultSaltHex = salt.toString('hex');
   vaultKeyCache = crypto.pbkdf2Sync(masterPassword, salt, PBKDF2_ITERATIONS, 32, 'sha256');
   vaultDataCache = defaultVaultData();
 
-  // Migración desde el esquema viejo, si existe.
   if (hasLegacyPlainConfig()) {
     try {
       const legacy = JSON.parse(fs.readFileSync(LEGACY_CONFIG_PATH, 'utf-8'));
@@ -96,11 +81,6 @@ function createVault(masterPassword) {
   if (fs.existsSync(LEGACY_SESSIONS_PATH)) {
     try {
       const legacySessions = JSON.parse(fs.readFileSync(LEGACY_SESSIONS_PATH, 'utf-8'));
-      // Las sesiones viejas estaban cifradas con SU PROPIA master password
-      // (la de CorexTerm), distinta de la nueva. No podemos migrar los
-      // secretos automáticamente sin pedir esa contraseña vieja también, así
-      // que migramos solo la metadata visible y dejamos el secreto vacío —
-      // el usuario tendrá que reintroducir la contraseña/clave de cada sesión.
       vaultDataCache.ctSessions = (legacySessions.sessions || []).map((s) => ({ ...s, secret: null, tunnel: s.tunnel ? { ...s.tunnel, secret: null } : undefined }));
     } catch (e) { /* ignore */ }
   }
@@ -109,7 +89,6 @@ function createVault(masterPassword) {
   return { migratedLegacy: hasLegacyPlainConfig() };
 }
 
-// Vault ya existe: probamos a descifrarlo con la contraseña dada.
 function unlockVault(masterPassword) {
   const raw = JSON.parse(fs.readFileSync(VAULT_PATH, 'utf-8'));
   const salt = Buffer.from(raw.salt, 'hex');
@@ -129,9 +108,6 @@ function isVaultUnlocked() {
   return vaultKeyCache != null && vaultDataCache != null;
 }
 
-// loadConfig/saveConfig ahora leen/escriben sobre el vault descifrado en
-// memoria — todo el resto del código (AWX, Jira, SMTP, favoritos...) sigue
-// funcionando igual, solo cambia de dónde sale el dato.
 function loadConfig() {
   if (!isVaultUnlocked()) return defaultVaultData();
   return vaultDataCache;
@@ -169,14 +145,13 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// ── Generic HTTP request helper (no external deps, works for Jira + AWX) ───
 function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUnauthorized = true, _redirectCount = 0 }) {
   return new Promise((resolve, reject) => {
     let u;
     try {
       u = new URL(url);
     } catch (e) {
-      reject(new Error('URL inválida: ' + url));
+      reject(new Error('Invalid URL: ' + url));
       return;
     }
     const lib = u.protocol === 'https:' ? https : http;
@@ -196,12 +171,8 @@ function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUna
     if (payload) options.headers['Content-Length'] = Buffer.byteLength(payload);
 
     const req = lib.request(options, (res) => {
-      // Algunos servidores Jira/AWX on-prem redirigen (p.ej. al contexto /jira)
-      // con 301/302/307/308. Los seguimos automáticamente hasta 3 veces, manteniendo
-      // siempre https aunque el Location apunte a http (algunos balanceadores
-      // internos lo hacen por error, pero la conexión saliente real sigue siendo https).
       if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location && _redirectCount < 3) {
-        res.resume(); // descarta el cuerpo de la redirección
+        res.resume(); // discard the redirect body
         let nextUrl;
         try {
           nextUrl = new URL(res.headers.location, url);
@@ -239,10 +210,6 @@ ipcMain.handle('config:set', async (event, partial) => {
   return merged;
 });
 
-// ── Vínculos Ticket ↔ Job Template ──────────────────────────────────────
-// El usuario decide a ojo qué tickets son "de AWX" (no hay regla automática
-// fiable en Jira para esto). Una vez decide, lo recordamos: la próxima vez
-// que abra ese ticket, COREX ya sabe qué template sugerirle.
 ipcMain.handle('ticketLinks:get', async () => {
   const cfg = loadConfig();
   return cfg.ticketLinks || {};
@@ -264,7 +231,6 @@ ipcMain.handle('ticketLinks:remove', async (event, { key }) => {
   return cfg.ticketLinks;
 });
 
-// ── Favoritos de Job Templates (marca manual, independiente del uso) ───────
 ipcMain.handle('favorites:get', async () => {
   const cfg = loadConfig();
   return cfg.favoriteTemplates || [];
@@ -287,8 +253,6 @@ ipcMain.handle('templateUsage:get', async () => {
 
 // ── AWX ──────────────────────────────────────────────────────────────────
 function awxAuthHeader(awx) {
-  // Algunos usuarios no pueden generar tokens (sin permiso en AWX), así que
-  // soportamos también Basic Auth con usuario/contraseña como alternativa.
   if (awx.authType === 'basic') {
     const basic = Buffer.from(`${awx.username}:${awx.password}`).toString('base64');
     return { Authorization: `Basic ${basic}` };
@@ -305,7 +269,7 @@ function awxConfigured(awx) {
 // List job templates the user can see
 ipcMain.handle('awx:listJobTemplates', async () => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/job_templates/?page_size=200`,
@@ -313,7 +277,7 @@ ipcMain.handle('awx:listJobTemplates', async () => {
       rejectUnauthorized: awx.verifySsl !== false,
     });
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `Permisos insuficientes (HTTP ${res.status})` };
+      return { ok: false, error: `Insufficient permissions (HTTP ${res.status})` };
     }
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
@@ -322,18 +286,16 @@ ipcMain.handle('awx:listJobTemplates', async () => {
   }
 });
 
-// Surveys: muchos templates exigen responder preguntas antes de poder lanzarse.
-// Sin esto, el launch falla en el momento de ejecutar en vez de antes.
 ipcMain.handle('awx:getSurveySpec', async (event, { templateId }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/job_templates/${templateId}/survey_spec/`,
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
-    if (res.status === 404) return { ok: true, spec: null }; // sin survey configurado
+    if (res.status === 404) return { ok: true, spec: null }; // no survey configured
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, spec: res.body };
   } catch (e) {
@@ -341,12 +303,9 @@ ipcMain.handle('awx:getSurveySpec', async (event, { templateId }) => {
   }
 });
 
-// Instance groups disponibles para asignar al lanzar (paso "Instance Groups" del wizard).
-// AWX permite elegir entre TODOS los instance groups de la organización, no solo los
-// que el template ya tenga preasignados — por eso pedimos el listado global.
 ipcMain.handle('awx:listInstanceGroups', async () => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/instance_groups/?page_size=200`,
@@ -360,12 +319,9 @@ ipcMain.handle('awx:listInstanceGroups', async () => {
   }
 });
 
-// Inventories y credentials disponibles, para el paso "Other Prompts" cuando el
-// template permite elegirlos en el momento de lanzar (ask_inventory_on_launch,
-// ask_credential_on_launch).
 ipcMain.handle('awx:listInventories', async () => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/inventories/?page_size=200`,
@@ -381,7 +337,7 @@ ipcMain.handle('awx:listInventories', async () => {
 
 ipcMain.handle('awx:listCredentials', async () => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/credentials/?page_size=200`,
@@ -397,7 +353,7 @@ ipcMain.handle('awx:listCredentials', async () => {
 
 ipcMain.handle('awx:listExecutionEnvironments', async () => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/execution_environments/?page_size=200`,
@@ -414,7 +370,7 @@ ipcMain.handle('awx:listExecutionEnvironments', async () => {
 // Launch a job template, optionally passing extra_vars (e.g. { ticket: "OPS-1234" })
 ipcMain.handle('awx:launchJob', async (event, { templateId, extraVars, launchOptions }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const body = { ...(launchOptions || {}) };
     if (extraVars) body.extra_vars = extraVars;
@@ -427,12 +383,11 @@ ipcMain.handle('awx:launchJob', async (event, { templateId, extraVars, launchOpt
       rejectUnauthorized: awx.verifySsl !== false,
     });
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `Sin permiso de ejecución sobre este template (HTTP ${res.status})` };
+      return { ok: false, error: `No execution permission for this template (HTTP ${res.status})` };
     }
     if (res.status >= 400) {
       return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     }
-    // Registrar uso para el contador "veces lanzado" (no afecta orden salvo que el usuario lo decida)
     const cfg = loadConfig();
     cfg.templateUsage = cfg.templateUsage || {};
     cfg.templateUsage[templateId] = (cfg.templateUsage[templateId] || 0) + 1;
@@ -446,7 +401,7 @@ ipcMain.handle('awx:launchJob', async (event, { templateId, extraVars, launchOpt
 // Poll a job's status
 ipcMain.handle('awx:getJob', async (event, { jobId }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/jobs/${jobId}/`,
@@ -463,7 +418,7 @@ ipcMain.handle('awx:getJob', async (event, { jobId }) => {
 // Fetch plaintext stdout of a finished/running job
 ipcMain.handle('awx:getJobStdout', async (event, { jobId }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const res = await httpRequest({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/jobs/${jobId}/stdout/?format=txt`,
@@ -477,11 +432,9 @@ ipcMain.handle('awx:getJobStdout', async (event, { jobId }) => {
   }
 });
 
-// Historial completo de ejecuciones de un template (no solo los últimos 10 que
-// ya vienen en recent_jobs). Paginado: la página 1 trae los más recientes primero.
 ipcMain.handle('awx:getTemplateJobHistory', async (event, { templateId, page }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const pageNum = page || 1;
     const res = await httpRequest({
@@ -501,11 +454,9 @@ ipcMain.handle('awx:getTemplateJobHistory', async (event, { templateId, page }) 
   }
 });
 
-// Jobs recientes de TODOS los templates — para la vista principal de AWX,
-// a diferencia de getTemplateJobHistory que es por un template concreto.
 ipcMain.handle('awx:getRecentJobs', async (event, { limit }) => {
   const { awx } = loadConfig();
-  if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
+  if (!awxConfigured(awx)) return { ok: false, error: 'AWX is not configured' };
   try {
     const pageSize = limit || 8;
     const res = await httpRequest({
@@ -521,6 +472,12 @@ ipcMain.handle('awx:getRecentJobs', async (event, { limit }) => {
 });
 
 // ── Jira ─────────────────────────────────────────────────────────────────
+function jiraConfigured(jira) {
+  if (!jira || !jira.url || !jira.token) return false;
+  if (jira.authType === 'bearer') return true;
+  return !!jira.email;
+}
+
 function jiraAuthHeader(jira) {
   // Supports either API token (Cloud: email+token) or PAT (Server/DC: bearer)
   if (jira.authType === 'bearer') {
@@ -532,14 +489,14 @@ function jiraAuthHeader(jira) {
 
 ipcMain.handle('jira:getIssue', async (event, { key }) => {
   const { jira } = loadConfig();
-  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
   try {
     const res = await httpRequest({
       url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}`,
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: sin permisos de lectura` };
+    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: no read permissions` };
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, issue: res.body };
   } catch (e) {
@@ -547,11 +504,9 @@ ipcMain.handle('jira:getIssue', async (event, { key }) => {
   }
 });
 
-// Lista los tickets asignados al usuario actual (sin resolver, los más recientes primero).
-// Usamos JQL con currentUser() para no tener que saber/guardar tu username de Jira.
 ipcMain.handle('jira:searchMyIssues', async () => {
   const { jira } = loadConfig();
-  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
   try {
     const jql = encodeURIComponent('assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC');
     const fields = encodeURIComponent('summary,status,priority,updated,issuetype,components,parent');
@@ -560,7 +515,7 @@ ipcMain.handle('jira:searchMyIssues', async () => {
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: sin permisos de lectura` };
+    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: no read permissions` };
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     return { ok: true, issues: (res.body && res.body.issues) || [] };
   } catch (e) {
@@ -568,9 +523,40 @@ ipcMain.handle('jira:searchMyIssues', async () => {
   }
 });
 
+
+function jiraTextToAdf(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  return {
+    type: 'doc',
+    version: 1,
+    content: lines.length ? lines.map((line) => ({
+      type: 'paragraph',
+      content: line ? [{ type: 'text', text: line }] : [],
+    })) : [{ type: 'paragraph', content: [] }],
+  };
+}
+
+function parseResponseBody(data) {
+  try { return data ? JSON.parse(data) : null; } catch (e) { return data; }
+}
+
+function safeMultipartFilename(filename) {
+  return String(filename || 'attachment').replace(/["\r\n]/g, '_');
+}
+
+function guessMimeType(filename) {
+  const ext = path.extname(String(filename || '')).toLowerCase();
+  const map = {
+    '.txt': 'text/plain', '.log': 'text/plain', '.html': 'text/html', '.htm': 'text/html', '.json': 'application/json',
+    '.csv': 'text/csv', '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.zip': 'application/zip', '.gz': 'application/gzip', '.tar': 'application/x-tar',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
 ipcMain.handle('jira:addComment', async (event, { key, body }) => {
   const { jira } = loadConfig();
-  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
   try {
     const res = await httpRequest({
       url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/comment`,
@@ -579,8 +565,20 @@ ipcMain.handle('jira:addComment', async (event, { key, body }) => {
       body: { body },
       rejectUnauthorized: jira.verifySsl !== false,
     });
+    if (res.status === 400 && jira.authType !== 'bearer') {
+      // Jira Cloud often requires Atlassian Document Format on /rest/api/3.
+      const cloudRes = await httpRequest({
+        url: `${jira.url.replace(/\/$/, '')}/rest/api/3/issue/${key}/comment`,
+        method: 'POST',
+        headers: jiraAuthHeader(jira),
+        body: { body: jiraTextToAdf(body) },
+        rejectUnauthorized: jira.verifySsl !== false,
+      });
+      if (cloudRes.status < 400) return { ok: true, comment: cloudRes.body };
+      return { ok: false, error: `HTTP ${cloudRes.status}: ${JSON.stringify(cloudRes.body)}` };
+    }
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `HTTP ${res.status}: sin permiso para comentar (ver rol Service Desk Agent)` };
+      return { ok: false, error: `HTTP ${res.status}: no permission to comment (check the Service Desk Agent role)` };
     }
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     return { ok: true, comment: res.body };
@@ -592,78 +590,91 @@ ipcMain.handle('jira:addComment', async (event, { key, body }) => {
 // Attach a file (e.g. HTML report) to a Jira issue. Jira requires multipart/form-data
 // with the header X-Atlassian-Token: no-check, so we build the multipart body manually
 // to avoid extra dependencies.
-ipcMain.handle('jira:addAttachment', async (event, { key, filename, contentBase64 }) => {
-  const { jira } = loadConfig();
-  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
-
+function jiraUploadAttachmentBuffer(jira, key, filename, fileBuffer, mimeType) {
   return new Promise((resolve) => {
     let u;
-    try {
-      u = new URL(`${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/attachments`);
-    } catch (e) {
-      resolve({ ok: false, error: 'URL de Jira inválida' });
-      return;
-    }
-    const boundary = '----CorexBoundary' + Date.now();
-    const fileBuffer = Buffer.from(contentBase64, 'base64');
-
-    const prePart = Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: text/html\r\n\r\n`
-    );
+    try { u = new URL(`${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/attachments`); }
+    catch (e) { resolve({ ok: false, error: 'Invalid Jira URL' }); return; }
+    const boundary = '----CorexBoundary' + crypto.randomBytes(12).toString('hex');
+    const safeName = safeMultipartFilename(filename);
+    const prePart = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeName}"\r\nContent-Type: ${mimeType || guessMimeType(safeName)}\r\n\r\n`);
     const postPart = Buffer.from(`\r\n--${boundary}--\r\n`);
     const body = Buffer.concat([prePart, fileBuffer, postPart]);
-
     const lib = u.protocol === 'https:' ? https : http;
-    const authHeader = jiraAuthHeader(jira);
-
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname,
-        method: 'POST',
-        headers: {
-          ...authHeader,
-          'X-Atlassian-Token': 'no-check',
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          'Content-Length': body.length,
-        },
-        rejectUnauthorized: jira.verifySsl !== false,
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => {
-          let parsed = null;
-          try { parsed = data ? JSON.parse(data) : null; } catch (e) { parsed = data; }
-          if (res.statusCode === 401 || res.statusCode === 403) {
-            resolve({ ok: false, error: `HTTP ${res.statusCode}: sin permiso para adjuntar archivos` });
-            return;
-          }
-          if (res.statusCode >= 400) {
-            resolve({ ok: false, error: `HTTP ${res.statusCode}: ${JSON.stringify(parsed)}` });
-            return;
-          }
-          resolve({ ok: true, attachment: parsed });
-        });
-      }
-    );
+    const req = lib.request({
+      hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname, method: 'POST',
+      headers: { ...jiraAuthHeader(jira), 'X-Atlassian-Token': 'no-check', 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+      rejectUnauthorized: jira.verifySsl !== false,
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        const parsed = parseResponseBody(data);
+        if (res.statusCode === 401 || res.statusCode === 403) { resolve({ ok: false, error: `HTTP ${res.statusCode}: no permission to attach files` }); return; }
+        if (res.statusCode >= 400) { resolve({ ok: false, error: `HTTP ${res.statusCode}: ${JSON.stringify(parsed)}` }); return; }
+        resolve({ ok: true, attachment: parsed });
+      });
+    });
     req.on('error', (err) => resolve({ ok: false, error: err.message }));
-    req.write(body);
-    req.end();
+    req.write(body); req.end();
   });
+}
+
+ipcMain.handle('jira:addAttachment', async (event, { key, filename, contentBase64, mimeType }) => {
+  const { jira } = loadConfig();
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
+  return jiraUploadAttachmentBuffer(jira, key, filename, Buffer.from(contentBase64, 'base64'), mimeType || guessMimeType(filename));
 });
 
-// Descarga binaria — a diferencia de httpRequest (que acumula la respuesta
-// como string y corrompe contenido no-UTF8), esta acumula Buffers reales,
-// imprescindible para imágenes/PDFs/zips adjuntos a un ticket.
+ipcMain.handle('jira:pickAndAttachFile', async (event, { key }) => {
+  const { jira } = loadConfig();
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
+  const picked = await dialog.showOpenDialog({ properties: ['openFile'] });
+  if (picked.canceled || !picked.filePaths || !picked.filePaths[0]) return { ok: false, canceled: true };
+  const filePath = picked.filePaths[0];
+  return jiraUploadAttachmentBuffer(jira, key, path.basename(filePath), fs.readFileSync(filePath), guessMimeType(filePath));
+});
+
+ipcMain.handle('jira:listTransitions', async (event, { key }) => {
+  const { jira } = loadConfig();
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
+  try {
+    const res = await httpRequest({ url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/transitions`, headers: jiraAuthHeader(jira), rejectUnauthorized: jira.verifySsl !== false });
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
+    return { ok: true, transitions: (res.body && res.body.transitions) || [] };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('jira:transitionIssue', async (event, { key, transitionId, transitionName }) => {
+  const { jira } = loadConfig();
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
+  try {
+    let id = transitionId;
+    if (!id && transitionName) {
+      const list = await httpRequest({ url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/transitions`, headers: jiraAuthHeader(jira), rejectUnauthorized: jira.verifySsl !== false });
+      if (list.status >= 400) return { ok: false, error: `HTTP ${list.status}: ${JSON.stringify(list.body)}` };
+      const transitions = (list.body && list.body.transitions) || [];
+      const normalizeTransitionText = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const wanted = normalizeTransitionText(transitionName);
+      const transitionText = (t) => normalizeTransitionText(`${t.name || ''} ${t.to && t.to.name || ''}`);
+      const match = transitions.find((t) => normalizeTransitionText(t.name) === wanted || normalizeTransitionText(t.to && t.to.name) === wanted)
+        || transitions.find((t) => transitionText(t).includes(wanted));
+      if (!match) return { ok: false, error: `No matching transition/status is available: ${transitionName}` };
+      id = match.id;
+    }
+    const res = await httpRequest({ url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/transitions`, method: 'POST', headers: jiraAuthHeader(jira), body: { transition: { id } }, rejectUnauthorized: jira.verifySsl !== false });
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
 function httpDownloadBinary({ url, headers = {}, rejectUnauthorized = true, _redirectCount = 0 }) {
   return new Promise((resolve, reject) => {
     let u;
     try {
       u = new URL(url);
     } catch (e) {
-      reject(new Error('URL inválida: ' + url));
+      reject(new Error('Invalid URL: ' + url));
       return;
     }
     const lib = u.protocol === 'https:' ? https : http;
@@ -688,7 +699,7 @@ function httpDownloadBinary({ url, headers = {}, rejectUnauthorized = true, _red
 
 ipcMain.handle('jira:downloadAttachment', async (event, { url, suggestedName }) => {
   const { jira } = loadConfig();
-  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  if (!jiraConfigured(jira)) return { ok: false, error: 'Jira is not configured' };
   try {
     const { filePath, canceled } = await dialog.showSaveDialog({ defaultPath: suggestedName || 'attachment' });
     if (canceled || !filePath) return { ok: false, canceled: true };
@@ -706,10 +717,9 @@ ipcMain.handle('jira:downloadAttachment', async (event, { url, suggestedName }) 
   }
 });
 
-// ── Email (SMTP ya configurado por el usuario) ──────────────────────────
 ipcMain.handle('mail:send', async (event, { to, subject, html, attachFilename }) => {
   const { smtp } = loadConfig();
-  if (!smtp || !smtp.host) return { ok: false, error: 'SMTP no configurado' };
+  if (!smtp || !smtp.host) return { ok: false, error: 'SMTP is not configured' };
   try {
     const nodemailer = require('nodemailer');
     const transporter = nodemailer.createTransport({
@@ -734,10 +744,9 @@ ipcMain.handle('mail:send', async (event, { to, subject, html, attachFilename })
   }
 });
 
-// ── File / clipboard helpers (heredados de ReportGen) ───────────────────
 ipcMain.handle('save-markdown', async (event, { content, defaultName }) => {
   const { filePath, canceled } = await dialog.showSaveDialog({
-    title: 'Guardar reporte',
+    title: 'Save report',
     defaultPath: defaultName || 'report.md',
     filters: [{ name: 'Markdown', extensions: ['md'] }],
   });
@@ -748,7 +757,7 @@ ipcMain.handle('save-markdown', async (event, { content, defaultName }) => {
 
 ipcMain.handle('save-html', async (event, { content, defaultName }) => {
   const { filePath, canceled } = await dialog.showSaveDialog({
-    title: 'Guardar reporte HTML',
+    title: 'Save HTML report',
     defaultPath: defaultName || 'report.html',
     filters: [{ name: 'HTML', extensions: ['html'] }],
   });
@@ -762,9 +771,6 @@ ipcMain.handle('copy-clipboard', async (event, { content }) => {
   return { success: true };
 });
 
-// ── Dashboard: métricas de hardware local ───────────────────────────────────
-// Una sola llamada agregada (en vez de 6 IPC separadas) porque el renderer
-// va a refrescar esto cada pocos segundos — más barato así.
 ipcMain.handle('dashboard:getMetrics', async () => {
   try {
     const [cpuLoad, mem, cpuTemp, battery, fsSize, netStats, processes, cpuInfo] = await Promise.all([
@@ -784,8 +790,6 @@ ipcMain.handle('dashboard:getMetrics', async () => {
       .slice(0, 8)
       .map((p) => ({ name: p.name, pid: p.pid, cpu: p.cpu, mem: p.mem }));
 
-    // Filtramos sistemas de archivos virtuales/de red poco útiles para el usuario
-    // (montajes de red, overlays, tmpfs...) — nos quedamos con discos físicos reales.
     const disks = fsSize
       .filter((d) => d.size > 0 && !/^(rclone|overlay|tmpfs|squashfs|proc|sysfs|devtmpfs)/i.test(d.type || d.fs || ''))
       .map((d) => ({ fs: d.fs, mount: d.mount, use: d.use, size: d.size, used: d.used }));
@@ -817,13 +821,7 @@ ipcMain.handle('dashboard:getMetrics', async () => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CorexTerm — IPC handlers: master password, sesiones, SSH, SFTP, terminal
-// ═══════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Vault — IPC handlers de desbloqueo (pedido al arrancar la app entera)
-// ═══════════════════════════════════════════════════════════════════════════
 
 ipcMain.handle('vault:exists', async () => {
   return { exists: vaultExists() };
@@ -842,16 +840,7 @@ ipcMain.handle('vault:isUnlocked', async () => {
   return { unlocked: isVaultUnlocked() };
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CorexTerm — IPC handlers: sesiones, SSH, SFTP, terminal
-// ═══════════════════════════════════════════════════════════════════════════
-// Los secretos de las sesiones ya no se cifran individualmente — viven en
-// texto plano DENTRO del vault, que en sí mismo está cifrado en disco como un
-// solo blob. Es el mismo nivel de protección, con un solo punto de cifrado.
 
-// ── Sesiones guardadas ───────────────────────────────────────────────────
-// Listamos sin los secretos — la lista solo trae metadata (host, usuario,
-// tipo de auth, tunnel) para pintar la UI. El secreto se usa solo al conectar.
 ipcMain.handle('corexterm:listSessions', async () => {
   const cfg = loadConfig();
   const sessions = cfg.ctSessions || [];
@@ -888,8 +877,6 @@ ipcMain.handle('corexterm:saveSession', async (event, { session }) => {
     authType: session.authType, // 'password' | 'key'
     color: session.color || null,
     folder: session.folder || null,
-    // Si no se proporciona un secreto nuevo (p.ej. al editar sin tocar la
-    // contraseña), conservamos el que ya hubiera.
     secret: session.secret || (existing ? existing.secret : null),
   };
   if (session.authType === 'key') {
@@ -921,11 +908,6 @@ ipcMain.handle('corexterm:deleteSession', async (event, { id }) => {
   return { ok: true };
 });
 
-// ── Macros ───────────────────────────────────────────────────────────────
-// Guardadas dentro del vault (no en texto plano) porque una macro grabada
-// puede incluir cualquier cosa que se haya tecleado, incluida información
-// sensible (rutas internas, nombres de usuario, fragmentos de comandos con
-// secretos pegados por error, etc).
 ipcMain.handle('corexterm:listMacros', async () => {
   const cfg = loadConfig();
   return { ok: true, macros: cfg.ctMacros || [] };
@@ -957,8 +939,6 @@ function getDecryptedSession(id) {
   return session || null;
 }
 
-// ── Conexión SSH + shell interactivo (vía node-pty si está disponible) ───
-// Mapa de sesiones activas: sessionKey -> { sshClient, stream, ptyProcess }
 const activeTerminals = new Map();
 
 function buildSSHConnectConfig(sessionData) {
@@ -988,9 +968,6 @@ ipcMain.handle('corexterm:connect', async (event, { sessionId, terminalId, cols,
     const conn = new SSHClient();
     const connectConfig = buildSSHConnectConfig(sessionData);
 
-    // Soporte de proxy jump / túnel: si hay un host intermedio configurado,
-    // primero conectamos a ese, y desde ahí abrimos un canal hacia el destino
-    // real en vez de conectar directo.
     const finalConnect = (targetConfig, sock) => {
       return new Promise((resolve, reject) => {
         const targetConn = sock ? new SSHClient() : conn;
@@ -1037,10 +1014,6 @@ ipcMain.handle('corexterm:connect', async (event, { sessionId, terminalId, cols,
       activeTerminals.set(terminalId, { sshConn });
     }
 
-    // Shell interactivo sobre el canal SSH — el PTY remoto lo gestiona el
-    // propio servidor SSH (sshConn.shell() lo solicita), node-pty no
-    // interviene aquí: solo hace falta para procesos LOCALES (ver
-    // corexterm:connectLocal más abajo).
     sshConn.shell({ term: 'xterm-256color', cols: cols || 80, rows: rows || 24 }, (err, stream) => {
       if (err) {
         activeTerminals.delete(terminalId);
@@ -1066,9 +1039,6 @@ ipcMain.handle('corexterm:connect', async (event, { sessionId, terminalId, cols,
   }
 });
 
-// Terminal local: shell real de la máquina del usuario (bash/zsh en
-// Linux/Mac, PowerShell en Windows), sin pasar por SSH — esto es lo que
-// MobaXterm llama "Local terminal". Aquí sí usamos node-pty de verdad.
 ipcMain.handle('corexterm:connectLocal', async (event, { terminalId, cols, rows }) => {
   if (!pty) return { ok: false, error: 'node-pty is not available on this platform/build. See setup instructions.' };
   try {
@@ -1257,19 +1227,13 @@ ipcMain.handle('corexterm:sftpDisconnect', async (event, { sessionId }) => {
   return { ok: true };
 });
 
-// Selector de archivo para elegir la clave privada SSH (.pem/.key) al
-// configurar una sesión con autenticación por clave.
 ipcMain.handle('corexterm:pickKeyFile', async () => {
   const { filePaths, canceled } = await dialog.showOpenDialog({ properties: ['openFile'] });
   if (canceled || filePaths.length === 0) return { ok: false };
   return { ok: true, path: filePaths[0] };
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  VS Corex — explorador de archivos local + Git
-// ═══════════════════════════════════════════════════════════════════════════
 
-// ── Explorador de archivos local ────────────────────────────────────────
 ipcMain.handle('vscorex:pickFolder', async () => {
   const { filePaths, canceled } = await dialog.showOpenDialog({ properties: ['openDirectory'] });
   if (canceled || filePaths.length === 0) return { ok: false };
@@ -1282,7 +1246,7 @@ ipcMain.handle('vscorex:listLocalDir', async (event, { dirPath }) => {
     return {
       ok: true,
       entries: entries
-        .filter((e) => !e.name.startsWith('.') || e.name === '.git') // ocultamos dotfiles, salvo .git (lo necesitamos para detectar repos)
+        .filter((e) => !e.name.startsWith('.') || e.name === '.git') // hide dotfiles except .git, which is needed to detect repositories
         .map((e) => ({
           name: e.name,
           isDirectory: e.isDirectory(),
@@ -1347,13 +1311,8 @@ ipcMain.handle('vscorex:deleteLocalEntry', async (event, { entryPath, isDirector
   }
 });
 
-// ── Git ──────────────────────────────────────────────────────────────────
-// Git nunca es un requisito para que COREX arranque. Si el binario no está
-// disponible, cada operación falla con un error claro y reconocible
-// ('git-not-found') que el frontend usa para mostrar el aviso de instalación
-// en vez de un error genérico.
 function isGitNotFoundError(e) {
-  return e && (e.code === 'ENOENT' || /not found|no se encontró|ENOENT/i.test(e.message || ''));
+  return e && (e.code === 'ENOENT' || /not found|ENOENT/i.test(e.message || ''));
 }
 
 ipcMain.handle('vscorex:checkGitAvailable', async () => {
