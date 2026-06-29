@@ -18,7 +18,6 @@ contextBridge.exposeInMainWorld('corexAPI', {
   awxGetTemplateJobHistory: (templateId, page) => ipcRenderer.invoke('awx:getTemplateJobHistory', { templateId, page }),
   awxGetRecentJobs: (limit) => ipcRenderer.invoke('awx:getRecentJobs', { limit }),
 
-  // Favoritos y uso de templates
   favoritesGet: () => ipcRenderer.invoke('favorites:get'),
   favoritesToggle: (templateId) => ipcRenderer.invoke('favorites:toggle', { templateId }),
   templateUsageGet: () => ipcRenderer.invoke('templateUsage:get'),
@@ -27,14 +26,18 @@ contextBridge.exposeInMainWorld('corexAPI', {
   jiraGetIssue: (key) => ipcRenderer.invoke('jira:getIssue', { key }),
   jiraSearchMyIssues: () => ipcRenderer.invoke('jira:searchMyIssues'),
   jiraAddComment: (key, body) => ipcRenderer.invoke('jira:addComment', { key, body }),
-  jiraAddAttachment: (key, filename, contentBase64) =>
-    ipcRenderer.invoke('jira:addAttachment', { key, filename, contentBase64 }),
+  jiraAddAttachment: (key, filename, contentBase64, mimeType) =>
+    ipcRenderer.invoke('jira:addAttachment', { key, filename, contentBase64, mimeType }),
+  jiraPickAndAttachFile: (key) => ipcRenderer.invoke('jira:pickAndAttachFile', { key }),
+  jiraListTransitions: (key) => ipcRenderer.invoke('jira:listTransitions', { key }),
+  jiraTransitionIssue: (key, transitionId, transitionName) =>
+    ipcRenderer.invoke('jira:transitionIssue', { key, transitionId, transitionName }),
   jiraDownloadAttachment: (url, suggestedName) =>
     ipcRenderer.invoke('jira:downloadAttachment', { url, suggestedName }),
 
-  // Vínculos ticket ↔ template
   ticketLinksGet: () => ipcRenderer.invoke('ticketLinks:get'),
-  ticketLinksSet: (key, templateId, templateName) => ipcRenderer.invoke('ticketLinks:set', { key, templateId, templateName }),
+  ticketLinksSet: (key, templateId, templateName, automationProfileId) =>
+    ipcRenderer.invoke('ticketLinks:set', { key, templateId, templateName, automationProfileId }),
   ticketLinksRemove: (key) => ipcRenderer.invoke('ticketLinks:remove', { key }),
 
   // Mail
@@ -49,7 +52,6 @@ contextBridge.exposeInMainWorld('corexAPI', {
   saveHtml: (content, defaultName) => ipcRenderer.invoke('save-html', { content, defaultName }),
   copyClipboard: (content) => ipcRenderer.invoke('copy-clipboard', { content }),
 
-  // CorexTerm — master password / sesiones
   vaultExists: () => ipcRenderer.invoke('vault:exists'),
   vaultUnlock: (masterPassword) => ipcRenderer.invoke('vault:unlock', { masterPassword }),
   vaultIsUnlocked: () => ipcRenderer.invoke('vault:isUnlocked'),
@@ -61,7 +63,6 @@ contextBridge.exposeInMainWorld('corexAPI', {
   corextermDeleteMacro: (id) => ipcRenderer.invoke('corexterm:deleteMacro', { id }),
   corextermPickKeyFile: () => ipcRenderer.invoke('corexterm:pickKeyFile'),
 
-  // CorexTerm — terminal SSH interactivo
   corextermConnect: (sessionId, terminalId, cols, rows) =>
     ipcRenderer.invoke('corexterm:connect', { sessionId, terminalId, cols, rows }),
   corextermConnectLocal: (terminalId, cols, rows) =>
@@ -96,7 +97,6 @@ contextBridge.exposeInMainWorld('corexAPI', {
   corextermSftpDelete: (sessionId, remotePath, isDirectory) => ipcRenderer.invoke('corexterm:sftpDelete', { sessionId, remotePath, isDirectory }),
   corextermSftpDisconnect: (sessionId) => ipcRenderer.invoke('corexterm:sftpDisconnect', { sessionId }),
 
-  // VS Corex — explorador de archivos local
   vscorexPickFolder: () => ipcRenderer.invoke('vscorex:pickFolder'),
   vscorexListLocalDir: (dirPath) => ipcRenderer.invoke('vscorex:listLocalDir', { dirPath }),
   vscorexReadLocalFile: (filePath) => ipcRenderer.invoke('vscorex:readLocalFile', { filePath }),

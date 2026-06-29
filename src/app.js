@@ -1,11 +1,10 @@
-// ═══════════════════════════════════════════════════════════════════════════
-//  COREX — renderer (vanilla JS, sin bundler)
-// ═══════════════════════════════════════════════════════════════════════════
 
 // ── State ──────────────────────────────────────────────────────────────────
 let state = {
   view: 'inbox', // 'inbox' | 'awx' | 'jira' | 'settings'
-  config: { jira: {}, awx: {}, smtp: {} },
+  config: { jira: {}, awx: {}, smtp: {}, automationProfiles: {} },
+  automationProfileEditorSelectedId: null,
+  ticketLinkProfileDraft: '',
   toast: null,
 
   // AWX runtime state
@@ -18,159 +17,115 @@ let state = {
   awxRunningJob: null, // { id, status, ... }
   awxStdout: '',
   awxPollHandle: null,
-  // Cuando se lanza un job desde el Inbox (vinculado a un ticket), guardamos
-  // la clave para poder comentar/adjuntar automáticamente al terminar.
   awxRunningJobTicketKey: null,
 
-  // Jira runtime state (vista de búsqueda por clave)
   jiraKeyInput: '',
   jiraIssue: null,
   jiraLoading: false,
   jiraError: null,
 
-  // Inbox / Dashboard (tickets asignados)
   inboxIssues: [],
   inboxLoading: false,
   inboxError: null,
-  inboxExpandedKey: null, // qué ticket tiene el panel de vínculo abierto
+  inboxExpandedKey: null, // ticket whose link panel is open
   ticketLinks: {}, // { 'ITSD-1234': { templateId, templateName, linkedAt } }
 
-  // Dashboard — métricas de hardware local
   hwMetrics: null,
   hwLoading: false,
   hwError: null,
   hwPollHandle: null,
-  // Historial para las gráficas en tiempo real — buffer de hasta 1h a una
-  // muestra cada 3s (1200 puntos). La ventana visible (60s/5m/1h) solo
-  // recorta una porción de este mismo buffer, no cambia el intervalo de
-  // polling — más simple y barato que tener varios buffers o reconfigurar
-  // el muestreo según lo que el usuario elija ver.
   hwHistory: [], // [{ t: timestamp, cpuUser, cpuSystem, memUsed, memTotal }]
   hwHistoryMaxPoints: 1200,
   hwTimeWindow: '60s', // '60s' | '5m' | '1h'
 
-  // Favoritos y uso de templates AWX
   favoriteTemplates: [], // [templateId, ...]
   templateUsage: {}, // { templateId: count }
   awxSortFavoritesFirst: false,
 
-  // Wizard de lanzamiento genérico: los pasos se derivan de los flags
-  // ask_*_on_launch del template, igual que hace el wizard nativo de AWX
-  // (Instance Groups → Other Prompts → Survey → Preview, cualquiera puede faltar).
-  awxLaunchWizard: null, // null = sin wizard activo (lanzamiento directo o sin pasos)
+  awxLaunchWizard: null, // null when no launch wizard is active
   awxLaunchLoading: false,
 
-  // Vista de detalle de Template (view: 'awx-detail')
   awxDetailTemplate: null,
-  awxDetailReturnView: 'awx', // a qué vista volver con "← Back" ('awx' o 'inbox')
+  awxDetailReturnView: 'awx', // view to return to with "← Back" ('awx' or 'inbox')
   awxJobHistory: [],
   awxJobHistoryLoading: false,
   awxJobHistoryError: null,
   awxJobHistoryPage: 1,
   awxJobHistoryHasNext: false,
 
-  // Jobs recientes de todos los templates, para la vista principal de AWX
-  // (estilo "Recent job runs" con chips de estado + blast radius)
   awxRecentJobs: [],
   awxRecentJobsLoading: false,
   awxRecentJobsError: null,
 
-  // Vista de detalle de Ticket (view: 'jira-detail')
   jiraDetailIssue: null,
   jiraDetailReturnView: 'inbox',
   jiraCommentDraft: '',
   jiraCommentSending: false,
   jiraAttachSending: false,
-  // Secciones colapsables de campos extra (p.ej. Business Justification) —
-  // colapsadas por defecto porque suelen traer texto largo (listas de
-  // servidores, justificaciones extensas) que no debería invadir la
-  // pantalla de entrada al detalle.
+  jiraTransitions: [],
+  jiraTransitionsLoading: false,
+  jiraTransitionSending: false,
   jiraDetailExpandedFields: {},
 
-  // Vault global — pantalla de bienvenida bloqueante antes de toda la app
   vaultUnlocked: false,
   vaultExists: false,
   vaultUnlockInput: '',
-  vaultUnlockConfirm: '', // solo se usa la primera vez, para confirmar la nueva Master Password
+  vaultUnlockConfirm: '', // only used the first time to confirm the new Master Password
   vaultUnlockError: null,
   vaultUnlocking: false,
 
   // CorexTerm (view: 'corexterm')
   ctSessions: [],
-  // Pestañas abiertas, como en un navegador: varios terminales pueden estar
-  // conectados a la vez, solo uno se muestra en cada momento.
-  ctOpenTerminalIds: [], // [terminalId, ...] en orden de apertura
-  ctActiveTerminalId: null, // cuál de las abiertas se muestra ahora mismo
-  ctTerminalInstances: {}, // { terminalId: { term, fitAddon, connected, kind, label } } — solo en memoria, no serializable
+  ctOpenTerminalIds: [], // [terminalId, ...] in open order
+  ctActiveTerminalId: null, // currently visible open terminal
+  ctTerminalInstances: {}, // { terminalId: { term, fitAddon, connected, kind, label } } — in-memory only, not serializable
   ctShowSessionForm: false,
   ctEditingSessionId: null,
-  ctSessionForm: null, // objeto del formulario en curso (ver newSessionForm())
+  ctSessionForm: null, // active form object (see newSessionForm())
 
-  // SFTP — panel lateral dentro de una pestaña SSH (no separado, como en MobaXterm)
-  ctSftpOpenFor: null, // terminalId de la pestaña que tiene el panel SFTP abierto
+  ctSftpOpenFor: null, // terminalId of the tab with the SFTP panel open
   ctSftpPath: '.',
   ctSftpEntries: [],
   ctSftpLoading: false,
   ctSftpError: null,
-  // Editor inline al hacer doble-click en un archivo remoto
   ctEditorFile: null, // { remotePath, content, dirty }
   ctEditorSaving: false,
 
-  // Split screen: 'single' (solo la pestaña activa) | 'h2' (2 horizontal) |
-  // 'v2' (2 vertical) | 'grid4' (4 en cuadrícula) — igual que el botón
-  // "Split" de MobaXterm. ctSplitSlots asigna qué terminalId va en cada
-  // celda; null = celda vacía (se puede asignar luego).
   ctSplitMode: 'single',
   ctSplitSlots: [null, null, null, null],
 
-  // Carpetas colapsadas en la lista de sesiones (por nombre de carpeta)
   ctCollapsedFolders: {},
 
-  // MultiExec / Broadcast — igual que en MobaXterm: lo que se escribe en el
-  // terminal activo se replica a todas las pestañas SSH abiertas (no al
-  // terminal local, no tiene sentido enviarle comandos de un host remoto).
   ctBroadcastMode: false,
 
-  // Macros — grabar una secuencia de teclas en un terminal y repetirla
-  // después, en el mismo terminal o en otro distinto (igual que MobaXterm:
-  // "everything you type will be recorded in order to replay it later on
-  // other servers").
   ctRecordingMacro: false,
-  ctMacroBuffer: '', // teclas acumuladas durante la grabación en curso
-  ctMacros: [], // [{ id, name, keys }] — persistidas en el vault
+  ctMacroBuffer: '', // keys accumulated during the current recording
+  ctMacros: [], // [{ id, name, keys }] — persisted in the vault
   ctShowMacroPanel: false,
 
   // VS Corex (view: 'vscorex')
   vsMonacoLoaded: false,
-  vsWorkspaceKind: null, // 'local' | 'remote' | null (sin workspace abierto)
-  vsWorkspaceRoot: null, // ruta local, o remotePath si es 'remote'
-  vsWorkspaceSessionId: null, // sessionId de CorexTerm si el workspace es remoto
-  vsExplorerTree: {}, // { path: { entries, expanded } } — árbol perezoso, se expande bajo demanda
+  vsWorkspaceKind: null, // 'local' | 'remote' | null when no workspace is open
+  vsWorkspaceRoot: null, // local path, or remotePath when kind is 'remote'
+  vsWorkspaceSessionId: null, // CorexTerm sessionId when the workspace is remote
+  vsExplorerTree: {}, // { path: { entries, expanded } } — lazy tree expanded on demand
   vsOpenFiles: [], // [{ id, path, name, kind: 'local'|'remote', sessionId, content, dirty, model }]
   vsActiveFileId: null,
-  vsGitAvailable: null, // null = sin comprobar todavía, true/false tras comprobar
+  vsGitAvailable: null, // null = not checked yet, true/false after checking
   vsGitStatus: null,
   vsGitPanelOpen: false,
   vsGitCommitMessage: '',
-  vsGitDiffFile: null, // path del archivo cuyo diff se está mostrando
+  vsGitDiffFile: null, // path of the file whose diff is shown
   vsGitDiffContent: '',
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Sistema de diseño — tokens centralizados
-// ═══════════════════════════════════════════════════════════════════════════
-// Antes de esto, cada una de las ~38 funciones de render definía sus propios
-// valores de fuente/espaciado/color sueltos, lo que con el tiempo derivó en
-// 17 tamaños de fuente y 30 colores hex distintos para conceptos que en
-// realidad eran los mismos 6-8. T (type), S (space) y C (color) son los
-// tokens únicos; todo el código nuevo debe usarlos en vez de strings sueltas.
 const T = {
   xs: '10px',   // metadatos, timestamps
   sm: '11px',   // labels, botones secundarios
   base: '13px', // cuerpo de texto, default
-  md: '15px',   // subtítulos de sección
-  lg: '20px',   // títulos de vista (H1)
-  xl: '24px',   // pantallas a página completa (vault gate)
+  md: '15px',   // section subtitles
+  lg: '20px',   // view titles (H1)
+  xl: '24px',   // full-page screens (vault gate)
 };
 
 const S = {
@@ -178,17 +133,17 @@ const S = {
 };
 
 const R = {
-  sm: '3px',     // inputs, botones, tarjetas — el radio por defecto, casi siempre este
-  pill: '999px', // badges de estado/prioridad únicamente
+  sm: '3px',     // inputs, buttons, cards — default radius
+  pill: '999px', // status/priority badges only
 };
 
 const C = {
-  surface0: '#0a0b0d', // fondo de app
-  surface1: '#0d0e10', // tarjetas
-  surface2: '#14161a', // hover / elevado
-  border: '#22252a',   // único borde, siempre
+  surface0: '#0a0b0d', // app background
+  surface1: '#0d0e10', // cards
+  surface2: '#14161a', // hover / elevated
+  border: '#22252a',   // single border color
   textPrimary: '#dfe3e7',
-  textSecondary: '#5e6670', // único gris secundario
+  textSecondary: '#5e6670', // single secondary gray
   success: '#6ad17e',
   warning: '#c98a3a',
   danger: '#c94f4f',
@@ -225,12 +180,6 @@ function mk(tag, styleOrAttrs, children, attrs) {
   return el;
 }
 
-// Checkbox con apariencia propia — los <input type="checkbox"> nativos sin
-// estilo se ven como un rectángulo blanco vacío sobre fondo oscuro (sin
-// tema), sin marca visible ni siquiera al estar marcados. Este helper
-// dibuja un cuadrado propio (vacío / relleno verde con check) y mantiene
-// el input real técnicamente presente pero visualmente oculto, para que
-// el comportamiento de clic/teclado siga siendo el nativo del navegador.
 function renderCheckbox(checked, onChange, labelText) {
   const box = mk('span', {
     style: {
@@ -245,13 +194,6 @@ function renderCheckbox(checked, onChange, labelText) {
     }, ['✓']) : null,
   ].filter(Boolean));
 
-  // No usamos <label> envolviendo el <input> a propósito: un <label> que
-  // envuelve un checkbox reenvía el clic automáticamente al input además
-  // del clic directo, disparando onchange DOS VECES por cada clic real.
-  // Como nuestro onChange llama a renderApp() (que reconstruye el DOM),
-  // el doble disparo hacía que el checkbox pareciera "no marcarse nunca"
-  // — toggleaba a true y luego inmediatamente otra vez a false. En vez de
-  // eso, manejamos el clic manualmente sobre un <div>, una sola vez.
   const wrap = mk('div', {
     style: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' },
     onclick: () => onChange({ target: { checked: !checked } }),
@@ -274,10 +216,6 @@ function toast(msg, kind = 'ok') {
 
 // ── Layout ───────────────────────────────────────────────────────────────
 function renderSidebar() {
-  // Iconos propios (trazo, no relleno) para AWX/Jira/CorexTerm/VS Corex —
-  // inspirados en el concepto de cada herramienta o derivados del propio
-  // logo de COREX, sin reproducir marcas registradas de terceros (el logo
-  // real de Ansible y de Jira tienen uso de marca restringido).
   const iconAwx = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
     '<circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/>' +
     '<circle cx="12" cy="7" r="1.2" fill="currentColor"/>' +
@@ -343,9 +281,6 @@ function renderSidebar() {
     },
   });
 
-  // Marca de agua del logo — mismo SVG que el del header, solo más grande y
-  // muy tenue. Vive en una capa propia (z-index 0) para no interferir con
-  // el contenido real de la navegación, que va en su propia capa encima.
   nav.appendChild(mk('div', {
     html: logoSvg,
     style: {
@@ -356,20 +291,12 @@ function renderSidebar() {
 
   const content = mk('div', { style: { position: 'relative', zIndex: '1', display: 'flex', flexDirection: 'column', height: '100%' } });
 
-  // Logo a tamaño grande para el lockup vertical de marca (arriba del
-  // wordmark) — distinto del logoSvg de 18px que se sigue usando en otros
-  // contextos si hiciera falta más adelante.
   const brandLogoSvg = '<svg viewBox="0 0 15559.15 9394.27" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:48px;height:29px;display:block;margin:0 auto 10px;">' +
     '<polygon fill="currentColor" points="4445.48,7673.09 2222.74,4535.94 -0,7673.09" />' +
     '<polygon fill="currentColor" points="11113.67,1398.78 13336.4,4535.93 15559.15,1398.78" />' +
     '<polygon fill="currentColor" points="9039.43,9394.27 2383.41,0 7115.63,0 13771.67,9394.27" />' +
     '</svg>';
 
-  // Lockup vertical: logo grande arriba, wordmark "COREX" debajo en peso
-  // thin (100) + scaleY(0.70) para el efecto comprimido/achatado — el logo
-  // se agrandó para darle espacio real al texto en vez de forzarlo a un
-  // ancho que lo volvía ilegible (probado y descartado: comprimir el texto
-  // al ancho de un logo de 18px rompía la legibilidad).
   const brand = mk('div', {
     style: { padding: `${S[5]} ${S[5]} ${S[6]}`, textAlign: 'center', color: C.textPrimary },
   }, [
@@ -409,7 +336,7 @@ function renderSidebar() {
         },
         onclick: () => {
           state.view = it.id;
-          renderApp(); // ya decide aquí mismo si el polling de hardware debe correr o pararse
+          renderApp(); // this decides whether hardware polling should run or stop
           if (it.id === 'awx' && state.awxTemplates.length === 0) loadAwxTemplates();
           if (it.id === 'awx') loadAwxRecentJobs();
           if (it.id === 'inbox') loadInbox();
@@ -435,8 +362,6 @@ function renderSidebar() {
     });
   });
 
-  // Footer de estado — confirma que el vault sigue desbloqueado, visible
-  // siempre sin tener que ir a Settings a comprobarlo.
   content.appendChild(mk('div', {
     style: {
       marginTop: 'auto', padding: `${S[3]} ${S[5]}`, borderTop: `1px solid ${C.surface2}`,
@@ -479,42 +404,22 @@ function renderToast() {
 function renderApp() {
   const app = document.getElementById('app');
 
-  // Gate global: hasta que el vault esté desbloqueado, no se muestra nada
-  // más de la app — ni Dashboard, ni AWX, ni Jira. Esto es justo lo que pedía
-  // el cambio: la Master Password se pide al arrancar COREX, no al entrar a
-  // CorexTerm, porque ahora protege TODAS las credenciales (AWX/Jira/SMTP
-  // también), no solo las sesiones SSH.
   if (!state.vaultUnlocked) {
     app.innerHTML = '';
     app.appendChild(renderVaultGate());
     return;
   }
 
-  // El polling de hardware solo debe correr mientras estamos en el Dashboard.
-  // Lo decidimos aquí, en el único punto de render, en vez de en cada sitio
-  // que cambia de vista — así no hay forma de "olvidar" pararlo al navegar
-  // a un detalle (jira-detail, awx-detail...) desde dentro del Dashboard.
   if (state.view === 'inbox') {
     if (!state.hwPollHandle) startHwPolling();
   } else {
     stopHwPolling();
   }
 
-  // Reconstruimos todo el DOM en cada render (no hay virtual DOM), así que sin
-  // esto el navegador pierde la posición de scroll cada vez que el polling
-  // (hardware, jobs en vivo...) dispara un renderApp() de fondo. Solo
-  // preservamos el scroll si la vista no cambió — si el usuario navegó a otra
-  // sección, sí queremos arrancar arriba, como es normal.
   const prevMain = document.getElementById('corex-main-scroll');
   const sameView = prevMain && prevMain.dataset.view === state.view;
   const prevScrollTop = sameView ? prevMain.scrollTop : 0;
 
-  // Mismo problema, pero con el foco: algunos inputs (como el filtro de AWX)
-  // necesitan renderApp() en cada tecla para refrescar resultados en vivo,
-  // y al reconstruir todo el DOM, el navegador pierde el foco del input —
-  // por eso antes solo se podía escribir una letra a la vez. Capturamos
-  // aquí qué input tenía el foco (vía su atributo data-focus-key) y la
-  // posición del cursor, para restaurarlos tras reconstruir.
   const activeEl = document.activeElement;
   const focusKey = activeEl && activeEl.dataset ? activeEl.dataset.focusKey : null;
   const focusSelectionStart = activeEl && 'selectionStart' in activeEl ? activeEl.selectionStart : null;
@@ -544,10 +449,6 @@ function renderApp() {
   app.appendChild(layout);
   main.scrollTop = prevScrollTop;
 
-  // Restaurar el foco capturado antes de destruir el DOM — buscamos el
-  // input nuevo con el mismo data-focus-key y le devolvemos el foco y la
-  // posición exacta del cursor, para que escribir se sienta continuo en
-  // vez de perder el foco en cada tecla.
   if (focusKey) {
     const newFocusEl = main.querySelector(`[data-focus-key="${focusKey}"]`);
     if (newFocusEl) {
@@ -562,10 +463,6 @@ function renderApp() {
   if (t) app.appendChild(t);
 }
 
-// ── Init ───────────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-//  Vault — gate global de Master Password (bloquea toda la app hasta unlock)
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function checkVaultGate() {
   const res = await window.corexAPI.vaultExists();
@@ -577,8 +474,6 @@ async function submitVaultUnlock() {
   const pw = state.vaultUnlockInput;
   if (!pw.trim()) return;
 
-  // Primera vez (creando la Master Password): exigimos confirmación para
-  // evitar que un typo te deje fuera de tus propios datos sin darte cuenta.
   if (!state.vaultExists && pw !== state.vaultUnlockConfirm) {
     state.vaultUnlockError = 'Passwords do not match';
     renderApp();
@@ -605,8 +500,6 @@ async function submitVaultUnlock() {
     toast(res.migratedLegacy ? 'Master password set — your existing settings were migrated' : 'Master password set', 'ok');
   }
 
-  // Ahora que el vault está desbloqueado, cargamos todo lo que antes se
-  // cargaba directamente en init() — config, tickets, favoritos, sesiones...
   await loadAllAfterUnlock();
   renderApp();
 }
@@ -696,16 +589,11 @@ async function init() {
 
   setupCorextermListeners();
 
-  // Arrancamos siempre por el gate del vault — nada de AWX/Jira/config se
-  // carga hasta que el usuario introduce la Master Password correcta.
   await checkVaultGate();
 }
 
 init();
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  AWX — listar templates, lanzar jobs, ver estado/log en vivo
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function loadAwxTemplates() {
   state.awxLoading = true;
@@ -729,12 +617,6 @@ function stopAwxPolling() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Wizard de lanzamiento genérico — replica el wizard nativo de AWX:
-//  Instance Groups → Other Prompts → Survey → Preview, cada paso aparece solo
-//  si el template lo requiere (vía sus flags ask_*_on_launch / survey_enabled).
-//  Ningún paso está hardcodeado a un template concreto.
-// ═══════════════════════════════════════════════════════════════════════════
 
 const OTHER_PROMPT_FLAGS = [
   'ask_variables_on_launch', 'ask_limit_on_launch', 'ask_tags_on_launch', 'ask_skip_tags_on_launch',
@@ -747,8 +629,6 @@ function templateHasOtherPrompts(tpl) {
   return OTHER_PROMPT_FLAGS.some((flag) => tpl[flag]);
 }
 
-// Paso 1 al pulsar "Run": construimos el wizard mirando qué pasos aplican a
-// este template concreto. Si no aplica ninguno, lanzamos directo.
 async function prepareAwxLaunch(tpl) {
   state.awxSelectedTemplate = tpl;
   state.awxLaunchLoading = true;
@@ -775,7 +655,6 @@ async function prepareAwxLaunch(tpl) {
   if (needsOtherPrompts) wizard.steps.push('other_prompts');
   if (needsSurvey) wizard.steps.push('survey');
 
-  // Cargamos los datos de cada paso que aplique, en paralelo.
   const loaders = [];
   if (needsInstanceGroups) loaders.push(window.corexAPI.awxListInstanceGroups().then((r) => { if (r.ok) wizard.instanceGroups.available = r.results; }));
   if (needsOtherPrompts && tpl.ask_inventory_on_launch) loaders.push(window.corexAPI.awxListInventories().then((r) => { if (r.ok) wizard.inventories = r.results; }));
@@ -787,7 +666,6 @@ async function prepareAwxLaunch(tpl) {
         wizard.surveySpec = r.spec;
         r.spec.spec.forEach((q) => { wizard.surveyAnswers[q.variable] = q.default != null ? q.default : ''; });
       } else {
-        // El flag decía que había survey pero vino vacío: quitamos el paso para no bloquear.
         wizard.steps = wizard.steps.filter((s) => s !== 'survey');
       }
     }));
@@ -797,7 +675,6 @@ async function prepareAwxLaunch(tpl) {
   state.awxLaunchLoading = false;
 
   if (wizard.steps.length === 0) {
-    // Sin pasos que requieran input: lanzamos directo, como antes.
     launchAwxJob();
     return;
   }
@@ -812,15 +689,9 @@ function wizardStepValid(wizard) {
   if (step === 'survey' && wizard.surveySpec) {
     return !(wizard.surveySpec.spec || []).some((q) => q.required && !String(wizard.surveyAnswers[q.variable] || '').trim());
   }
-  // instance_groups y other_prompts son siempre opcionales para avanzar
-  // (igual que en AWX: puedes dejarlos vacíos y se usan los valores por defecto del template).
   return true;
 }
 
-// Como wizardStepValid() solo devuelve true/false, cuando el botón se queda
-// gris sin razón aparente no hay forma de saber cuál de las N preguntas es
-// la culpable sin abrir DevTools. Esta función identifica la pregunta
-// concreta que está bloqueando el avance, para mostrarlo en la propia UI.
 function wizardSurveyBlockingQuestion(wizard) {
   if (!wizard.surveySpec) return null;
   return (wizard.surveySpec.spec || []).find((q) => q.required && !String(wizard.surveyAnswers[q.variable] || '').trim()) || null;
@@ -832,7 +703,6 @@ function renderAwxLaunchWizard() {
   const step = wizard.steps[wizard.currentStepIndex];
   const wrap = mk('div', {});
 
-  // ── Indicador de pasos ──
   const stepLabels = { instance_groups: 'Instance Groups', other_prompts: 'Other Prompts', survey: 'Survey', preview: 'Preview' };
   const stepsRow = mk('div', { style: { display: 'flex', gap: '6px', marginBottom: '16px', flexWrap: 'wrap' } });
   wizard.steps.forEach((s, i) => {
@@ -852,7 +722,6 @@ function renderAwxLaunchWizard() {
 
   wrap.appendChild(mk('div', { style: { fontSize: '13px', fontWeight: '700', color: '#dfe3e7', marginBottom: '14px' } }, [tpl.name]));
 
-  // ── Contenido del paso actual ──
   if (step === 'instance_groups') {
     wrap.appendChild(renderInstanceGroupsStep(wizard));
   } else if (step === 'other_prompts') {
@@ -863,7 +732,6 @@ function renderAwxLaunchWizard() {
     wrap.appendChild(renderPreviewStep(wizard));
   }
 
-  // ── Navegación ──
   const valid = wizardStepValid(wizard);
   const navRow = mk('div', { style: { display: 'flex', gap: '8px', marginTop: '16px' } });
   if (wizard.currentStepIndex > 0) {
@@ -891,9 +759,6 @@ function renderAwxLaunchWizard() {
   }, ['Cancel']));
   wrap.appendChild(navRow);
 
-  // Si el botón está bloqueado en el paso de survey, decimos exactamente
-  // qué pregunta falta — sin esto, no hay forma de saberlo sin abrir
-  // DevTools cuando hay varios campos y "algo" no cuenta como relleno.
   if (!valid && step === 'survey') {
     const blocking = wizardSurveyBlockingQuestion(wizard);
     if (blocking) {
@@ -1011,10 +876,6 @@ function renderSurveyStep(wizard) {
       });
       col.appendChild(select);
     } else if (q.type === 'textarea') {
-      // AWX define 'textarea' como tipo de pregunta aparte de 'text' —
-      // multilínea de verdad, pensado justo para esto: pegar listas de
-      // servidores, bloques de configuración, etc. sin que se aplasten
-      // en una sola línea.
       const ta = mk('textarea', {
         style: {
           width: '100%', minHeight: '110px', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px',
@@ -1024,11 +885,6 @@ function renderSurveyStep(wizard) {
         'data-focus-key': `survey-${q.variable}`,
         oninput: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; },
       });
-      // A diferencia de <input>, un <textarea> no tiene atributo "value" —
-      // su contenido inicial hay que asignarlo a la propiedad .value del
-      // elemento DOM directamente, o setAttribute('value', ...) no hace
-      // nada y el campo siempre nace vacío visualmente en cada re-render,
-      // aunque wizard.surveyAnswers ya tuviera el texto guardado.
       ta.value = wizard.surveyAnswers[q.variable] || '';
       col.appendChild(ta);
     } else {
@@ -1063,10 +919,6 @@ function renderPreviewStep(wizard) {
     (wizard.surveySpec.spec || []).forEach((q) => {
       const answer = String(wizard.surveyAnswers[q.variable] || '');
       if (q.type === 'textarea' && answer.includes('\n')) {
-        // Mostramos explícitamente cada línea por separado — un <div> normal
-        // colapsa los \n visualmente aunque el dato en memoria sí los tenga,
-        // lo que puede dar la falsa impresión de que se va a enviar todo
-        // junto en una sola línea cuando en realidad está bien formado.
         const lines = answer.split('\n').filter((l) => l.trim());
         wrap.appendChild(mk('div', { style: { marginBottom: '2px' } }, [
           mk('span', { style: { color: '#5e6670' } }, [`${q.question_name} (${lines.length} lines): `]),
@@ -1095,12 +947,6 @@ async function launchAwxJob() {
 
   const extraVars = wizard ? { ...wizard.surveyAnswers } : {};
   if (wizard && wizard.surveySpec) {
-    // Normalizamos saltos de línea a \n puro en los campos textarea — en
-    // Windows, un <textarea> puede devolver \r\n (CRLF). Si el playbook de
-    // Ansible del otro lado hace un split('\n') simple, cada línea se queda
-    // con un \r residual al final (p.ej. "host01.axadmin.net\r"), lo que
-    // puede hacer que el host no se reconozca como válido y el job se
-    // comporte como si solo hubiera recibido una entrada.
     (wizard.surveySpec.spec || []).forEach((q) => {
       if (q.type === 'textarea' && typeof extraVars[q.variable] === 'string') {
         extraVars[q.variable] = extraVars[q.variable].replace(/\r\n/g, '\n');
@@ -1111,10 +957,6 @@ async function launchAwxJob() {
     extraVars.ticket = state.awxExtraVarsTicket.trim();
   }
 
-  // Verificación visible de que los saltos de línea de campos multilínea
-  // (textarea) llegan intactos hasta el momento de enviar — antes de que
-  // pasen por IPC y por la llamada HTTP a AWX. Si aquí ya se ven aplastados
-  // a una sola línea, el bug está en el formulario, no en el transporte.
   console.log('[COREX] extra_vars a enviar:', JSON.stringify(extraVars, null, 2));
 
   const launchOptions = {};
@@ -1170,14 +1012,136 @@ async function pollAwxJob(jobId) {
   renderApp();
 }
 
-// Hook: cuando el job termina, aquí enganchamos comentario/adjunto/correo más adelante
-function onAwxJobFinished(job) {
+// Hook: when an AWX job finishes, sync its result back to the linked Jira ticket.
+async function onAwxJobFinished(job) {
   const ok = job.status === 'successful';
   toast(
     ok ? t('awx_job_finished_ok', { id: job.id }) : t('awx_job_finished_status', { id: job.id, status: job.status }),
     ok ? 'ok' : 'err'
   );
+
+  const key = state.awxRunningJobTicketKey || (state.awxExtraVarsTicket && state.awxExtraVarsTicket.trim());
+  if (!key || !state.config.jira || !state.config.jira.url) return;
+
+  const issueRes = await window.corexAPI.jiraGetIssue(key);
+  const issue = issueRes.ok ? issueRes.issue : null;
+  const parentKey = issue && issue.fields && issue.fields.parent && issue.fields.parent.key;
+  const profile = getAutomationProfile(job, issue, key);
+  const ctx = buildAutomationContext(job, issue, key);
+
+  const summary = buildAwxCompletionComment(job, ok, profile, ctx);
+  const commentRes = await window.corexAPI.jiraAddComment(key, summary);
+  if (!commentRes.ok) toast(`Jira auto-comment failed: ${commentRes.error}`, 'err');
+
+  if (profile.attachStdout !== false && state.awxStdout) {
+    const base64 = btoa(unescape(encodeURIComponent(state.awxStdout)));
+    const attachRes = await window.corexAPI.jiraAddAttachment(key, `awx-job-${job.id}-stdout.txt`, base64, 'text/plain');
+    if (!attachRes.ok) toast(`Jira auto-attach failed: ${attachRes.error}`, 'err');
+  }
+
+  if (!ok) return;
+
+  const childDone = await transitionJiraByCandidates(key, asCandidateList(profile.childSuccessTransitions, ['Done', 'Completed', 'Complete']));
+  if (!childDone.ok) toast(`Jira sub-task transition skipped: ${childDone.error}`, 'err');
+
+  if (parentKey && profile.parent && profile.parent.enabled !== false) {
+    const parentComment = renderAutomationTemplate(profile.parent.comment || 'AWX job #{{job.id}} completed for {{ticketKey}}.', ctx);
+    const parentCommentRes = await window.corexAPI.jiraAddComment(parentKey, parentComment);
+    if (!parentCommentRes.ok) toast(`Jira parent comment failed: ${parentCommentRes.error}`, 'err');
+
+    const parentReview = await transitionParentToBuildPeerReview(parentKey, profile.parent);
+    if (!parentReview.ok) toast(`Jira parent transition skipped: ${parentReview.error}`, 'err');
+  }
 }
+
+function buildAwxCompletionComment(job, ok, profile, ctx) {
+  const configured = ok ? profile.successComment : profile.failureComment;
+  if (configured) return renderAutomationTemplate(configured, ctx);
+
+  return [
+    `COREX/AWX job #${job.id} finished with status: ${job.status}`,
+    job.name ? `Template/job: ${job.name}` : null,
+    job.started ? `Started: ${new Date(job.started).toLocaleString()}` : null,
+    job.finished ? `Finished: ${new Date(job.finished).toLocaleString()}` : null,
+    '',
+    'Stdout was attached automatically when available.',
+  ].filter((line) => line !== null).join('\n');
+}
+
+function getAutomationProfile(job, issue, key) {
+  const link = state.ticketLinks[key] || {};
+  const profiles = state.config.automationProfiles || {};
+  const templateId = String(link.templateId || job.unified_job_template || job.job_template || '');
+  const templateName = String(link.templateName || job.name || job.job_template_name || '').toLowerCase();
+  const directProfileId = link.automationProfileId || link.profileId || '';
+  const profile = (directProfileId && profiles[directProfileId])
+    || profiles[templateId]
+    || Object.values(profiles).find((p) => {
+      if (!p) return false;
+      const ids = Array.isArray(p.templateIds) ? p.templateIds.map(String) : [];
+      const names = Array.isArray(p.templateNameIncludes) ? p.templateNameIncludes : (p.templateNameIncludes ? [p.templateNameIncludes] : []);
+      return ids.includes(templateId) || names.some((name) => templateName.includes(String(name).toLowerCase()));
+    });
+  return {
+    attachStdout: true,
+    childSuccessTransitions: ['Done', 'Completed', 'Complete'],
+    parent: { enabled: false },
+    ...(profile || {}),
+  };
+}
+
+function buildAutomationContext(job, issue, key) {
+  const link = state.ticketLinks[key] || {};
+  return {
+    issue,
+    job,
+    link,
+    ticketKey: key,
+    parentKey: issue && issue.fields && issue.fields.parent && issue.fields.parent.key,
+    stdout: state.awxStdout || '',
+    templateName: link.templateName || job.name || job.job_template_name || '',
+  };
+}
+
+function getPath(obj, path) {
+  return String(path).split('.').reduce((acc, part) => (acc == null ? undefined : acc[part]), obj);
+}
+
+function renderAutomationTemplate(template, ctx) {
+  return String(template || '').replace(/{{\s*([\w.]+)\s*}}/g, (m, path) => {
+    const value = getPath(ctx, path);
+    return value == null ? '' : String(value);
+  });
+}
+
+function asCandidateList(value, fallback) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (typeof value === 'string') return value.split(',').map((x) => x.trim()).filter(Boolean);
+  return fallback;
+}
+
+async function transitionJiraByCandidates(key, candidates) {
+  let lastError = null;
+  for (const candidate of candidates) {
+    const res = await window.corexAPI.jiraTransitionIssue(key, null, candidate);
+    if (res.ok) return { ok: true, transition: candidate };
+    lastError = res.error;
+  }
+  return { ok: false, error: lastError || `No matching transition found: ${candidates.join(', ')}` };
+}
+
+async function transitionParentToBuildPeerReview(parentKey, parentProfile) {
+  // Some Jira workflows do not expose the target review transition until the
+  // parent leaves a waiting state, so we try the target, unblock it, then retry.
+  const direct = await transitionJiraByCandidates(parentKey, asCandidateList(parentProfile && parentProfile.transitions, ['Build Peer Review', 'To Build Peer Review']));
+  if (direct.ok) return direct;
+
+  const unblocked = await transitionJiraByCandidates(parentKey, asCandidateList(parentProfile && parentProfile.fallbackTransitions, ['In Progress', 'Start Progress']));
+  if (!unblocked.ok) return { ok: false, error: `${direct.error}; fallback failed: ${unblocked.error}` };
+
+  return transitionJiraByCandidates(parentKey, asCandidateList(parentProfile && parentProfile.retryTransitions, ['Build Peer Review', 'To Build Peer Review']));
+}
+
 
 function awxStatusColor(status) {
   const map = {
@@ -1193,8 +1157,6 @@ function awxStatusColor(status) {
   return map[status] || '#5e6670';
 }
 
-// Fondo tenue + texto de color para cada estado — más visible de un
-// vistazo que solo un borde, igual que en dashboards de monitorización.
 function awxStatusChipBg(status) {
   const map = {
     successful: '#102a18',
@@ -1262,12 +1224,6 @@ function renderRecentJobsSection() {
     if (job.elapsed) metaParts.push(`${job.elapsed.toFixed(0)}s elapsed`);
     row.appendChild(mk('div', { style: { fontSize: T.xs, color: C.textSecondary } }, [metaParts.join(' · ')]));
 
-    // Blast radius visual: solo lo mostramos si el job ha fallado o tiene
-    // hosts inalcanzables — para un job exitoso no aporta nada verlo.
-    // host_status_counts viene de la API de AWX con claves como ok/failed/
-    // dark(unreachable)/changed/skipped — sumamos failed+dark como "hosts
-    // con problema" para el blast radius, igual que hace la barra de
-    // estado de hosts en la UI nativa de AWX.
     const hsc = job.host_status_counts || {};
     const failedCount = (hsc.failed || 0) + (hsc.dark || 0);
     const totalHosts = Object.values(hsc).reduce((a, b) => a + b, 0);
@@ -1330,8 +1286,6 @@ function renderAwxView() {
     }, [`${t('awx_load_error')} ${state.awxError}`]));
   }
 
-  // Jobs recientes de todos los templates, con chips de estado + blast
-  // radius — panorama rápido antes de bajar a la lista completa.
   wrap.appendChild(renderRecentJobsSection());
 
   const headerRow = mk('div', {
@@ -1430,7 +1384,6 @@ function renderAwxView() {
   return wrap;
 }
 
-// ── Vista de detalle de un Template: info completa + lanzar (con survey) + log vivo + historial ──
 async function openAwxDetail(tpl, returnView) {
   state.awxSelectedTemplate = tpl;
   state.awxDetailTemplate = tpl;
@@ -1490,7 +1443,6 @@ function renderAwxDetailView() {
   const usageCount = state.templateUsage[tpl.id] || 0;
   const usageLabel = usageCount === 0 ? t('awx_never_run') : usageCount === 1 ? t('awx_used_once') : t('awx_used_times', { n: usageCount });
 
-  // ── Header con volver + favorito ──
   const headerRow = mk('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' } });
   headerRow.appendChild(mk('span', {
     style: { fontSize: '12px', color: '#dfe3e7', cursor: 'pointer', fontWeight: '600' },
@@ -1508,7 +1460,6 @@ function renderAwxDetailView() {
   wrap.appendChild(titleRow);
   wrap.appendChild(mk('p', { style: { fontSize: '12.5px', color: '#5e6670', marginBottom: '20px' } }, [tpl.description || `ID ${tpl.id} · ${usageLabel}`]));
 
-  // ── Info completa (lo que ya conocíamos del JSON real de AWX) ──
   const inv = tpl.summary_fields && tpl.summary_fields.inventory;
   const proj = tpl.summary_fields && tpl.summary_fields.project;
   const creds = (tpl.summary_fields && tpl.summary_fields.credentials) || [];
@@ -1546,7 +1497,6 @@ function renderAwxDetailView() {
     }, ['Your account doesn\u2019t have permission to run this template.']));
   }
 
-  // ── Lanzar (wizard genérico si hay pasos, formulario simple si no) ──
   const launchBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '20px', marginBottom: '24px' } });
 
   if (state.awxLaunchLoading) {
@@ -1586,7 +1536,6 @@ function renderAwxDetailView() {
   }
   wrap.appendChild(launchBox);
 
-  // ── Log en vivo del job actual ──
   if (state.awxRunningJob && state.awxSelectedTemplate && state.awxSelectedTemplate.id === tpl.id) {
     const job = state.awxRunningJob;
     const statusBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '20px', marginBottom: '24px' } });
@@ -1613,7 +1562,6 @@ function renderAwxDetailView() {
     wrap.appendChild(statusBox);
   }
 
-  // ── Historial completo de runs ──
   const historyBox = mk('div', {});
   historyBox.appendChild(mk('div', { style: { fontSize: '12px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '10px' } }, ['Run history']));
 
@@ -1648,9 +1596,6 @@ function renderAwxDetailView() {
   return wrap;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Jira — vista de lectura de tickets (heredado de ReportGen)
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function loadJiraIssue() {
   if (!state.jiraKeyInput.trim()) return;
@@ -1686,7 +1631,6 @@ function renderJiraView() {
     return wrap;
   }
 
-  // ── Buscador: para encontrar cualquier ticket puntual, no solo los propios ──
   const searchRow = mk('div', { style: { display: 'flex', gap: '10px', marginBottom: '20px' } });
   searchRow.appendChild(mk('input', {
     style: {
@@ -1715,7 +1659,6 @@ function renderJiraView() {
     }, [`Error: ${state.jiraError}`]));
   }
 
-  // Resultado de una búsqueda puntual por clave, si la hay.
   if (state.jiraIssue) {
     const f = state.jiraIssue.fields || {};
     const card = mk('div', {
@@ -1738,7 +1681,6 @@ function renderJiraView() {
     wrap.appendChild(card);
   }
 
-  // ── Lista completa de tickets asignados a mí, con vínculo y ejecución AWX ──
   wrap.appendChild(mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' } }, [
     mk('span', { style: { fontSize: '12px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px' } }, [
       `${t('tickets_section_title')} (${state.inboxIssues.length})`,
@@ -1783,8 +1725,6 @@ function renderJiraView() {
         (f.priority && f.priority.name) || t('inbox_no_priority'),
       ]),
     ]));
-    // Indicador de sub-tarea: si el ticket tiene padre, lo mostramos antes
-    // del título — más visible que tener que abrir el detalle para saberlo.
     if (f.parent) {
       leftCol.appendChild(mk('div', { style: { fontSize: '10.5px', color: '#5b9bd5', marginBottom: '2px' } }, [
         `↳ sub-task of ${f.parent.key}`,
@@ -1798,11 +1738,13 @@ function renderJiraView() {
 
     const actionCol = mk('div', { style: { flexShrink: '0', marginLeft: '14px' } });
     if (link) {
+      const linkedProfile = link.automationProfileId && state.config.automationProfiles && state.config.automationProfiles[link.automationProfileId];
       actionCol.appendChild(mk('div', { style: { textAlign: 'right' } }, [
         mk('div', {
           style: { fontSize: '11px', color: '#6ad17e', fontWeight: '600', marginBottom: '6px', cursor: 'pointer' },
           onclick: () => launchLinkedJob(key),
         }, [`→ ${link.templateName}`]),
+        linkedProfile ? mk('div', { style: { fontSize: '10.5px', color: '#5e6670', marginBottom: '6px' } }, [`Automation: ${linkedProfile.name || link.automationProfileId}`]) : null,
         jobRunningHere
           ? mk('span', { style: { fontSize: '11px', color: '#dfe3e7' } }, [t('inbox_running')])
           : mk('button', {
@@ -1823,7 +1765,6 @@ function renderJiraView() {
     topRow.appendChild(actionCol);
     card.appendChild(topRow);
 
-    // Panel de vínculo expandido: buscador inline de job templates AWX
     if (expanded && !link) {
       const linkPanel = mk('div', { style: { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #22252a' } });
       linkPanel.appendChild(mk('input', {
@@ -1837,6 +1778,22 @@ function renderJiraView() {
         'data-focus-key': 'awx-filter-ticket-link',
         oninput: (e) => { state.awxFilter = e.target.value; renderApp(); },
       }));
+
+      const profileOptions = profileEntries();
+      if (profileOptions.length) {
+        const select = mk('select', {
+          style: {
+            width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px',
+            padding: '8px 10px', color: '#dfe3e7', fontSize: '12.5px', marginBottom: '8px',
+          },
+          value: state.ticketLinkProfileDraft || '',
+          onchange: (e) => { state.ticketLinkProfileDraft = e.target.value; },
+        });
+        select.appendChild(mk('option', { value: '' }, ['Use automatic/default automation']));
+        profileOptions.forEach(([id, profile]) => select.appendChild(mk('option', { value: id }, [profile.name || id])));
+        select.value = state.ticketLinkProfileDraft || '';
+        linkPanel.appendChild(select);
+      }
 
       const filterText = state.awxFilter.trim().toLowerCase();
       const matches = (filterText
@@ -1855,7 +1812,7 @@ function renderJiraView() {
               padding: '8px 10px', borderRadius: '3px', marginBottom: '4px', cursor: 'pointer',
               background: '#0a0b0d', border: '1px solid #22252a',
             },
-            onclick: () => linkTicketToTemplate(key, tpl),
+            onclick: () => linkTicketToTemplate(key, tpl, state.ticketLinkProfileDraft),
           }, [
             mk('div', { style: { fontSize: '12.5px', color: '#dfe3e7', fontWeight: '600' } }, [tpl.name]),
           ]));
@@ -1873,9 +1830,6 @@ function renderJiraView() {
   return wrap;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Settings — configuración de AWX, Jira y SMTP
-// ═══════════════════════════════════════════════════════════════════════════
 
 function settingsField(label, value, onInput, opts) {
   opts = opts || {};
@@ -1894,8 +1848,24 @@ function settingsField(label, value, onInput, opts) {
   return col;
 }
 
-// Selector de dos opciones (p.ej. Bearer token vs Basic Auth) que re-renderiza
-// la vista entera al cambiar, para mostrar/ocultar los campos correspondientes.
+
+function settingsTextarea(label, value, onInput, opts) {
+  opts = opts || {};
+  const col = mk('div', { style: { marginBottom: '14px' } });
+  col.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, [label]));
+  const ta = mk('textarea', {
+    style: {
+      width: '100%', minHeight: opts.minHeight || '170px', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px',
+      padding: '9px 12px', color: '#dfe3e7', fontSize: '12px', fontFamily: 'monospace', resize: 'vertical',
+    },
+    placeholder: opts.placeholder || '',
+    oninput: (e) => onInput(e.target.value),
+  });
+  ta.value = value || '';
+  col.appendChild(ta);
+  return col;
+}
+
 function settingsToggleGroup(label, current, options, onChange) {
   const col = mk('div', { style: { marginBottom: '14px' } });
   col.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '6px' } }, [label]));
@@ -1932,6 +1902,166 @@ async function saveSettings() {
   state.awxTemplates = [];
 }
 
+function profileEntries() {
+  return Object.entries(state.config.automationProfiles || {}).filter(([id, profile]) => id && profile);
+}
+
+function ensureProfileEditorSelection() {
+  const entries = profileEntries();
+  if (!state.automationProfileEditorSelectedId && entries.length) state.automationProfileEditorSelectedId = entries[0][0];
+  if (state.automationProfileEditorSelectedId && !state.config.automationProfiles[state.automationProfileEditorSelectedId]) {
+    state.automationProfileEditorSelectedId = entries.length ? entries[0][0] : null;
+  }
+}
+
+function makeProfileId(name) {
+  const base = String(name || 'automation-template').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'automation-template';
+  let id = base;
+  let i = 2;
+  state.config.automationProfiles = state.config.automationProfiles || {};
+  while (state.config.automationProfiles[id]) id = `${base}-${i++}`;
+  return id;
+}
+
+function createAutomationProfile() {
+  state.config.automationProfiles = state.config.automationProfiles || {};
+  const id = makeProfileId('New automation template');
+  state.config.automationProfiles[id] = {
+    name: 'New automation template',
+    templateIds: [],
+    templateNameIncludes: [],
+    attachStdout: true,
+    successComment: 'Automation finished successfully for {{ticketKey}} via AWX job #{{job.id}}.',
+    failureComment: 'AWX job #{{job.id}} failed for {{ticketKey}}.',
+    childSuccessTransitions: ['Done', 'Completed', 'Complete'],
+    childFailureTransitions: [],
+    parent: { enabled: false, comment: '', transitions: [], fallbackTransitions: [], retryTransitions: [] },
+  };
+  state.automationProfileEditorSelectedId = id;
+  renderApp();
+}
+
+function deleteAutomationProfile(id) {
+  if (!id || !state.config.automationProfiles[id]) return;
+  delete state.config.automationProfiles[id];
+  state.automationProfileEditorSelectedId = null;
+  ensureProfileEditorSelection();
+  renderApp();
+}
+
+function csvToList(value) {
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function listToCsv(value) {
+  return Array.isArray(value) ? value.join(', ') : (value || '');
+}
+
+function profileField(label, value, onInput, opts) {
+  return settingsField(label, value, onInput, opts);
+}
+
+function profileTextarea(label, value, onInput, opts) {
+  return settingsTextarea(label, value, onInput, opts);
+}
+
+function renderProfileAwxTemplatePicker(profile) {
+  const box = mk('div', { style: { marginBottom: '14px' } });
+  box.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '6px' } }, ['AWX jobs linked to this automation template']));
+  const selected = (profile.templateIds || []).map(String);
+  const templates = (state.awxTemplates || []).slice(0, 80);
+  if (!templates.length) {
+    box.appendChild(mk('button', {
+      style: { background: '#14161a', color: '#dfe3e7', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 12px', cursor: 'pointer', fontSize: '12px' },
+      onclick: async () => { await loadAwxTemplates(); renderApp(); },
+    }, ['Load AWX jobs']));
+  } else {
+    const grid = mk('div', { style: { maxHeight: '170px', overflow: 'auto', border: '1px solid #22252a', borderRadius: '3px', padding: '8px', background: '#0a0b0d' } });
+    templates.forEach((tpl) => {
+      const id = String(tpl.id);
+      const row = mk('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 0', color: '#dfe3e7', fontSize: '12px', cursor: 'pointer' } });
+      const cb = mk('input', {
+        type: 'checkbox',
+        onchange: (e) => {
+          const ids = new Set((profile.templateIds || []).map(String));
+          if (e.target.checked) ids.add(id); else ids.delete(id);
+          profile.templateIds = Array.from(ids).map((x) => Number.isNaN(Number(x)) ? x : Number(x));
+          renderApp();
+        },
+      });
+      cb.checked = selected.includes(id);
+      row.appendChild(cb);
+      row.appendChild(mk('span', {}, [`#${tpl.id} ${tpl.name || 'Unnamed job'}`]));
+      grid.appendChild(row);
+    });
+    box.appendChild(grid);
+  }
+  box.appendChild(mk('p', { style: { fontSize: '11px', color: '#5e6670', margin: '6px 0 0' } }, ['You can also select a template when linking a Jira ticket to an AWX job.']));
+  return box;
+}
+
+function renderAutomationProfilesSection() {
+  ensureProfileEditorSelection();
+  const profiles = state.config.automationProfiles || {};
+  const entries = profileEntries();
+  const selectedId = state.automationProfileEditorSelectedId;
+  const selected = selectedId ? profiles[selectedId] : null;
+  const children = [
+    mk('p', { style: { fontSize: '11px', color: '#5e6670', lineHeight: '1.5', marginTop: '-4px' } }, [
+      'Create reusable automation templates with fields instead of JSON. Link them to AWX jobs here, or choose one while linking a Jira ticket to a job.',
+    ]),
+    mk('button', {
+      style: { background: '#dfe3e7', color: '#0a0b0d', border: 'none', borderRadius: '3px', padding: '9px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer', marginBottom: '14px' },
+      onclick: createAutomationProfile,
+    }, ['+ New automation template']),
+  ];
+
+  if (!entries.length) {
+    children.push(mk('div', { style: { border: '1px dashed #22252a', borderRadius: '4px', padding: '16px', color: '#5e6670', fontSize: '12px', lineHeight: '1.5' } }, [
+      'No automation templates yet. Create one to define comments, child-ticket transitions, parent-ticket actions and stdout attachment rules.',
+    ]));
+    return settingsSection('AWX → Jira automation templates', children);
+  }
+
+  const selector = mk('select', {
+    style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '9px 12px', color: '#dfe3e7', fontSize: '13px', marginBottom: '14px' },
+    onchange: (e) => { state.automationProfileEditorSelectedId = e.target.value; renderApp(); },
+  });
+  entries.forEach(([id, profile]) => selector.appendChild(mk('option', { value: id }, [profile.name || id])));
+  selector.value = selectedId || '';
+  children.push(selector);
+
+  if (selected) {
+    selected.parent = selected.parent || { enabled: false };
+    children.push(profileField('Template name', selected.name || selectedId, (v) => { selected.name = v; }));
+    children.push(renderProfileAwxTemplatePicker(selected));
+    children.push(profileField('Also match AWX job names containing', listToCsv(selected.templateNameIncludes), (v) => { selected.templateNameIncludes = csvToList(v); }, { placeholder: 'build, patch, restart' }));
+    children.push(settingsToggleGroup('Attach AWX stdout to the Jira ticket', selected.attachStdout === false ? 'no' : 'yes', [
+      { value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' },
+    ], (v) => { selected.attachStdout = v === 'yes'; }));
+    children.push(profileTextarea('Success comment for the linked ticket', selected.successComment || '', (v) => { selected.successComment = v; }, { minHeight: '95px', placeholder: 'Build completed successfully for {{ticketKey}}. AWX job #{{job.id}}.' }));
+    children.push(profileTextarea('Failure comment for the linked ticket', selected.failureComment || '', (v) => { selected.failureComment = v; }, { minHeight: '80px', placeholder: 'AWX job #{{job.id}} failed for {{ticketKey}}.' }));
+    children.push(profileField('Child success transitions', listToCsv(selected.childSuccessTransitions), (v) => { selected.childSuccessTransitions = csvToList(v); }, { placeholder: 'Done, Completed, Complete' }));
+
+    children.push(settingsToggleGroup('Update parent ticket', selected.parent.enabled === false ? 'no' : 'yes', [
+      { value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' },
+    ], (v) => { selected.parent.enabled = v === 'yes'; }));
+    if (selected.parent.enabled !== false) {
+      children.push(profileTextarea('Parent comment', selected.parent.comment || '', (v) => { selected.parent.comment = v; }, { minHeight: '70px', placeholder: 'To Build Peer Review' }));
+      children.push(profileField('Parent target transitions', listToCsv(selected.parent.transitions), (v) => { selected.parent.transitions = csvToList(v); }, { placeholder: 'Build Peer Review, To Build Peer Review' }));
+      children.push(profileField('Parent fallback transitions', listToCsv(selected.parent.fallbackTransitions), (v) => { selected.parent.fallbackTransitions = csvToList(v); }, { placeholder: 'In Progress, Start Progress' }));
+      children.push(profileField('Parent retry transitions', listToCsv(selected.parent.retryTransitions), (v) => { selected.parent.retryTransitions = csvToList(v); }, { placeholder: 'Build Peer Review' }));
+    }
+    children.push(mk('p', { style: { fontSize: '11px', color: '#5e6670', lineHeight: '1.5' } }, ['Placeholders: {{ticketKey}}, {{parentKey}}, {{job.id}}, {{job.name}}, {{job.status}}, {{templateName}}.']));
+    children.push(mk('button', {
+      style: { background: '#2a1111', color: '#ffb4b4', border: '1px solid #5b2424', borderRadius: '3px', padding: '8px 12px', cursor: 'pointer', fontSize: '12px' },
+      onclick: () => deleteAutomationProfile(selectedId),
+    }, ['Delete this automation template']));
+  }
+
+  return settingsSection('AWX → Jira automation templates', children);
+}
+
 function renderSettingsView() {
   const wrap = mk('div', {});
   wrap.appendChild(mk('h1', { style: { fontSize: '22px', fontWeight: '700', marginBottom: '4px', color: '#dfe3e7' } }, [t('settings_title')]));
@@ -1940,6 +2070,7 @@ function renderSettingsView() {
   state.config.awx = state.config.awx || {};
   state.config.jira = state.config.jira || {};
   state.config.smtp = state.config.smtp || {};
+  state.config.automationProfiles = state.config.automationProfiles || {};
   state.config.lang = state.config.lang || 'en';
 
   wrap.appendChild(settingsSection(t('settings_language'), [
@@ -1992,6 +2123,9 @@ function renderSettingsView() {
 
   wrap.appendChild(settingsSection(t('settings_jira_title'), jiraFields));
 
+
+  wrap.appendChild(renderAutomationProfilesSection());
+
   wrap.appendChild(settingsSection(t('settings_smtp_title'), [
     settingsField(t('settings_smtp_host'), state.config.smtp.host, (v) => (state.config.smtp.host = v), { placeholder: 'smtp.yourcompany.com' }),
     settingsField(t('settings_smtp_port'), state.config.smtp.port, (v) => (state.config.smtp.port = Number(v) || v), { placeholder: '587' }),
@@ -2008,13 +2142,7 @@ function renderSettingsView() {
   return wrap;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Inbox — tickets asignados, vinculación con AWX, lanzar y cerrar ciclo
-// ═══════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Dashboard — métricas de hardware local
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function loadHwMetrics() {
   const res = await window.corexAPI.dashboardGetMetrics();
@@ -2024,9 +2152,6 @@ async function loadHwMetrics() {
     state.hwError = null;
     state.hwMetrics = res;
 
-    // Acumular en el historial para las gráficas en tiempo real — buffer
-    // circular: si ya llegamos al máximo de puntos, se descarta el más
-    // antiguo en vez de crecer sin límite.
     state.hwHistory.push({
       t: Date.now(),
       cpuUser: res.cpu.user || 0,
@@ -2084,12 +2209,6 @@ function renderHwBar(label, pct, sublabel) {
   return row;
 }
 
-// Gauge circular SVG (arco de 270°, como un velocímetro) con bandas de
-// color FIJAS de fondo (verde/ámbar/rojo) — el progreso real se dibuja
-// encima, pero las bandas ya comunican "dónde está la zona de riesgo"
-// antes de leer el número, igual que en dashboards de monitorización
-// reales (Netdata, Grafana). Reusado para CPU / Memoria / Temperatura /
-// Batería / Disco en el Dashboard.
 function renderHwGauge(label, pct, sublabel) {
   const safePct = Math.max(0, Math.min(100, pct || 0));
   const color = hwBarColor(safePct);
@@ -2099,7 +2218,6 @@ function renderHwGauge(label, pct, sublabel) {
   const cx = size / 2;
   const cy = size / 2;
 
-  // Arco de 270°: empieza en 135° y recorre 270° en sentido horario.
   const startAngle = 135;
   const sweep = 270;
   const endAngle = startAngle + (sweep * safePct) / 100;
@@ -2129,8 +2247,6 @@ function renderHwGauge(label, pct, sublabel) {
   svg.setAttribute('height', size);
   svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
 
-  // Bandas fijas de fondo: 0-60 verde, 60-85 ámbar, 85-100 rojo — siempre
-  // en las mismas posiciones del arco, independientemente del valor actual.
   const bands = [
     { from: 0, to: 60, color: '#2a6b3d' },
     { from: 60, to: 85, color: '#9a6a2a' },
@@ -2213,10 +2329,6 @@ function renderHwTimeWindowPicker() {
   return wrap;
 }
 
-// Gráfica de área apilada en SVG — recibe varias series (arrays de
-// {t, value}) y las dibuja como polígonos apilados con su color
-// correspondiente. ymax fija la escala vertical (p.ej. 100 para %, o el
-// total de memoria en bytes).
 function renderStackedAreaChart(series, colors, ymax, widthPx, heightPx) {
   const svgNs = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(svgNs, 'svg');
@@ -2225,7 +2337,6 @@ function renderStackedAreaChart(series, colors, ymax, widthPx, heightPx) {
   svg.setAttribute('height', heightPx);
   svg.style.display = 'block';
 
-  // Líneas de cuadrícula horizontal, sutiles — referencia visual sin ruido.
   for (let g = 1; g < 4; g++) {
     const y = (heightPx / 4) * g;
     const line = document.createElementNS(svgNs, 'line');
@@ -2332,7 +2443,6 @@ function renderHardwareSection() {
 
   const m = state.hwMetrics;
 
-  // ── Fila de gauges: CPU, Memoria, Temperatura, Batería ──
   const gaugeRow = mk('div', { style: { display: 'flex', gap: '28px', justifyContent: 'space-around', flexWrap: 'wrap', marginBottom: '20px' } });
   gaugeRow.appendChild(renderHwGauge(t('hw_cpu'), m.cpu.load));
   gaugeRow.appendChild(renderHwGauge(t('hw_memory'), (m.mem.used / m.mem.total) * 100, formatBytes(m.mem.used)));
@@ -2353,7 +2463,7 @@ function renderHardwareSection() {
     wrap.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670', textAlign: 'center', marginTop: '-12px', marginBottom: '12px' } }, [t('hw_no_battery')]));
   }
 
-  // ── Discos / Red / Top procesos, en 2 columnas ──
+  // ── Disks / Network / Top processes, two columns ──
   const grid = mk('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', borderTop: '1px solid #22252a', paddingTop: '16px' } });
 
   const leftCol = mk('div', {});
@@ -2404,10 +2514,13 @@ function toggleInboxLink(key) {
   renderApp();
 }
 
-async function linkTicketToTemplate(key, tpl) {
-  state.ticketLinks = await window.corexAPI.ticketLinksSet(key, tpl.id, tpl.name);
+async function linkTicketToTemplate(key, tpl, automationProfileId) {
+  state.ticketLinks = await window.corexAPI.ticketLinksSet(key, tpl.id, tpl.name, automationProfileId || '');
   state.inboxExpandedKey = null;
-  toast(`${key} ${t('inbox_linked_toast')} "${tpl.name}"`, 'ok');
+  state.ticketLinkProfileDraft = '';
+  const profile = automationProfileId && state.config.automationProfiles && state.config.automationProfiles[automationProfileId];
+  const suffix = profile ? ` with automation "${profile.name || automationProfileId}"` : '';
+  toast(`${key} ${t('inbox_linked_toast')} "${tpl.name}"${suffix}`, 'ok');
   renderApp();
 }
 
@@ -2417,16 +2530,10 @@ async function unlinkTicket(key) {
   renderApp();
 }
 
-// Lanza el job ya vinculado a este ticket, desde el Inbox. Reutiliza la misma
-// lógica de polling que la vista AWX, pero recuerda la clave del ticket para
-// poder comentar/adjuntar automáticamente cuando el job termine.
 async function launchLinkedJob(key) {
   const link = state.ticketLinks[key];
   if (!link) return;
 
-  // Necesitamos el objeto template COMPLETO (con sus flags ask_*_on_launch)
-  // para que el wizard detecte bien los pasos — el fallback reducido no los
-  // tendría, así que si los templates no están cargados aún, los recargamos.
   if (state.awxTemplates.length === 0) {
     await loadAwxTemplates();
   }
@@ -2446,9 +2553,6 @@ function inboxPriorityColor(priority) {
   return '#5e6670';
 }
 
-// Rango numérico de severidad, mayor = más urgente. Devuelve null para
-// "sin prioridad real" (Not Prioritized, vacío, etc.) — esos no entran
-// en el top de tickets prioritarios del Dashboard.
 function priorityRank(priority) {
   const name = (priority && priority.name || '').toLowerCase();
   if (!name || name.includes('not prioritized') || name.includes('sin prioridad')) return null;
@@ -2458,9 +2562,6 @@ function priorityRank(priority) {
   return 1; // cualquier otra prioridad nombrada (low, p5...) sigue contando como "tiene prioridad"
 }
 
-// Top 3 tickets con prioridad real asignada, ordenados de más a menos urgente.
-// Si solo hay 1 o 2 con prioridad real, se muestran solo esos — nunca se
-// rellena con tickets sin prioridad solo para llegar a 3.
 function topPriorityIssues(issues) {
   return issues
     .map((issue) => ({ issue, rank: priorityRank(issue.fields && issue.fields.priority) }))
@@ -2508,16 +2609,10 @@ function renderInboxView() {
   wrap.appendChild(mk('h1', { style: { fontSize: '22px', fontWeight: '700', marginBottom: '4px', color: '#dfe3e7' } }, [t('inbox_title')]));
   wrap.appendChild(mk('p', { style: { fontSize: '13px', color: '#5e6670', marginBottom: '20px' } }, [t('inbox_subtitle')]));
 
-  // Las métricas de hardware no dependen de Jira/AWX, así que se muestran siempre.
   wrap.appendChild(renderHardwareSection());
 
-  // Gráficas en tiempo real de CPU/Memoria, con ventana de tiempo elegible
-  // por el usuario (60s/5m/1h) — usan el mismo historial que se acumula
-  // en cada tick del polling, no dependen de Jira/AWX tampoco.
   wrap.appendChild(renderHwChartsSection());
 
-  // El Dashboard es solo panorama — sin botones de acción. La lista completa
-  // de tickets, con vincular/ejecutar AWX, vive en la vista Jira.
   if (state.config.jira && state.config.jira.url) {
     const topSection = renderTopTicketsSection();
     if (topSection) wrap.appendChild(topSection);
@@ -2526,9 +2621,6 @@ function renderInboxView() {
   return wrap;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Jira — vista de detalle de ticket: info completa + comentar + adjuntar
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function openJiraDetail(key, returnView) {
   state.jiraDetailReturnView = returnView || 'inbox';
@@ -2541,6 +2633,7 @@ async function openJiraDetail(key, returnView) {
   state.jiraLoading = false;
   if (res.ok) {
     state.jiraDetailIssue = res.issue;
+    loadJiraTransitions(key);
   } else {
     toast(`Error: ${res.error}`, 'err');
     state.view = returnView || 'inbox';
@@ -2560,16 +2653,53 @@ async function sendJiraComment() {
   } else {
     toast(t('jira_detail_comment_sent'), 'ok');
     state.jiraCommentDraft = '';
-    // Recargamos el ticket para que el comentario nuevo aparezca en la lista sin recargar a mano.
     const issueRes = await window.corexAPI.jiraGetIssue(state.jiraDetailIssue.key);
     if (issueRes.ok) state.jiraDetailIssue = issueRes.issue;
   }
   renderApp();
 }
 
-// Adjunta el log/stdout del job más reciente vinculado a este ticket, como
-// un archivo .txt simple. (Cuando tengamos un generador de reportes HTML,
-// este es el punto donde se enchufa: mismo flujo, distinto contenido/filename.)
+
+async function loadJiraTransitions(key) {
+  state.jiraTransitionsLoading = true;
+  const res = await window.corexAPI.jiraListTransitions(key);
+  state.jiraTransitionsLoading = false;
+  state.jiraTransitions = res.ok ? res.transitions : [];
+  renderApp();
+}
+
+async function transitionJiraIssue(transitionId) {
+  if (!state.jiraDetailIssue || !transitionId) return;
+  state.jiraTransitionSending = true;
+  renderApp();
+  const res = await window.corexAPI.jiraTransitionIssue(state.jiraDetailIssue.key, transitionId, null);
+  state.jiraTransitionSending = false;
+  if (!res.ok) toast(`Transition failed: ${res.error}`, 'err');
+  else {
+    toast('Ticket status updated', 'ok');
+    const issueRes = await window.corexAPI.jiraGetIssue(state.jiraDetailIssue.key);
+    if (issueRes.ok) state.jiraDetailIssue = issueRes.issue;
+    loadJiraTransitions(state.jiraDetailIssue.key);
+  }
+  renderApp();
+}
+
+async function pickAndAttachJiraFile() {
+  if (!state.jiraDetailIssue) return;
+  state.jiraAttachSending = true;
+  renderApp();
+  const res = await window.corexAPI.jiraPickAndAttachFile(state.jiraDetailIssue.key);
+  state.jiraAttachSending = false;
+  if (res.canceled) { renderApp(); return; }
+  if (!res.ok) toast(`${t('jira_detail_attach_failed')} ${res.error}`, 'err');
+  else {
+    toast(t('jira_detail_attach_sent'), 'ok');
+    const issueRes = await window.corexAPI.jiraGetIssue(state.jiraDetailIssue.key);
+    if (issueRes.ok) state.jiraDetailIssue = issueRes.issue;
+  }
+  renderApp();
+}
+
 async function attachJobOutputToJira() {
   if (!state.jiraDetailIssue) return;
   if (!state.awxStdout) {
@@ -2581,7 +2711,7 @@ async function attachJobOutputToJira() {
 
   const base64 = btoa(unescape(encodeURIComponent(state.awxStdout)));
   const filename = `job-output-${state.awxRunningJob ? state.awxRunningJob.id : 'latest'}.txt`;
-  const res = await window.corexAPI.jiraAddAttachment(state.jiraDetailIssue.key, filename, base64);
+  const res = await window.corexAPI.jiraAddAttachment(state.jiraDetailIssue.key, filename, base64, 'text/plain');
   state.jiraAttachSending = false;
   if (!res.ok) {
     toast(`${t('jira_detail_attach_failed')} ${res.error}`, 'err');
@@ -2591,8 +2721,6 @@ async function attachJobOutputToJira() {
   renderApp();
 }
 
-// Campos custom específicos de esta instancia de Jira (Solera). Si en otra
-// instancia no existen, simplemente no habrá datos y no se muestran — no rompe nada.
 const JIRA_CUSTOM_FIELDS = {
   slaTimeToResolution: 'customfield_15324',
   slaTimeToFirstResponse: 'customfield_15325',
@@ -2600,24 +2728,15 @@ const JIRA_CUSTOM_FIELDS = {
   businessJustification: 'customfield_15098',
 };
 
-// ── Conversor de Jira wiki markup → HTML ────────────────────────────────────
-// Jira Server/DC (no Cloud) guarda los comentarios en wiki markup, no en texto
-// plano ni ADF. Cubre lo que aparece en comentarios reales: headers (h1.-h6.),
-// listas con viñetas anidadas (*, **, ***) y numeradas (#, ##), negrita (*x*),
-// cursiva (_x_), monoespaciado ({{x}}) y enlaces ([texto|url]).
 function jiraWikiToHtml(raw) {
   if (!raw) return '';
 
-  // Escapamos HTML antes de aplicar el markup, para que el texto del usuario
-  // nunca se interprete como etiquetas reales.
   const escapeHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   const lines = raw.replace(/\r\n/g, '\n').split('\n');
   const htmlParts = [];
-  let listStack = []; // [{tag, depth}] — pila de niveles de lista abiertos
+  let listStack = []; // [{tag, depth}] — stack of open list levels
 
-  // Cierra niveles de lista hasta dejar solo los de profundidad <= depth.
-  // Cada nivel cerrado cierra su <li> contenedor y su <ul>/<ol>.
   function closeListsTo(depth) {
     while (listStack.length > 0 && listStack[listStack.length - 1].depth > depth) {
       const top = listStack.pop();
@@ -2654,12 +2773,10 @@ function jiraWikiToHtml(raw) {
       const content = (bulletMatch || numberMatch)[2];
 
       if (listStack.length === 0 || listStack[listStack.length - 1].depth < depth) {
-        // Nuevo nivel anidado: se abre dentro del <li> del nivel padre (si existe).
         htmlParts.push(`<${tag} style="margin:2px 0 2px 18px;padding:0;"><li style="margin-bottom:2px;">`);
         listStack.push({ tag, depth });
       } else {
         if (listStack[listStack.length - 1].depth > depth) closeListsTo(depth);
-        // Mismo nivel: cerramos el <li> anterior y abrimos uno nuevo.
         htmlParts.push('</li><li style="margin-bottom:2px;">');
       }
       htmlParts.push(inlineFormat(content));
@@ -2676,9 +2793,6 @@ function jiraWikiToHtml(raw) {
   return htmlParts.join('');
 }
 
-// Jira da .friendly siempre en horas/minutos (p.ej. "154h"), incluso para SLAs
-// de varios días — poco legible. Calculamos nosotros desde .millis y mostramos
-// en días+horas cuando supera las 24h, en horas+minutos si no.
 function formatDurationMillis(millis) {
   if (millis == null) return '—';
   const totalMinutes = Math.round(Math.abs(millis) / 60000);
@@ -2735,8 +2849,6 @@ function renderJiraDetailView() {
   const f = issue.fields || {};
   const link = state.ticketLinks[issue.key];
 
-  // ── Breadcrumb del ticket padre, si existe — destacado para que sea
-  // imposible no notarlo, no un gris apagado que se confunde con metadata.
   if (f.parent) {
     wrap.appendChild(mk('div', {
       style: {
@@ -2755,7 +2867,6 @@ function renderJiraDetailView() {
   wrap.appendChild(mk('div', { style: { fontSize: '12px', color: '#dfe3e7', fontWeight: '700', marginBottom: '4px' } }, [issue.key]));
   wrap.appendChild(mk('h1', { style: { fontSize: '19px', fontWeight: '700', color: '#dfe3e7', marginBottom: '10px' } }, [f.summary || '(untitled)']));
 
-  // ── Metadatos: estado, assignee, reporter, assignment group ──
   const assignmentGroup = f[JIRA_CUSTOM_FIELDS.assignmentGroup];
   const metaParts = [
     `${t('jira_status_label')}: ${(f.status && f.status.name) || '—'}`,
@@ -2797,9 +2908,6 @@ function renderJiraDetailView() {
     wrap.appendChild(descBox);
   }
 
-  // ── Business Justification — colapsable, suele traer texto largo
-  // (listas de servidores, contexto extenso) que no debería invadir la
-  // pantalla de entrada al detalle.
   const businessJustification = f[JIRA_CUSTOM_FIELDS.businessJustification];
   if (businessJustification) {
     const expanded = !!state.jiraDetailExpandedFields.businessJustification;
@@ -2822,10 +2930,6 @@ function renderJiraDetailView() {
     wrap.appendChild(section);
   }
 
-  // ── Adjuntos existentes — imágenes y cualquier otro formato, con botón
-  // de descarga propio (la API de Jira para adjuntos requiere las mismas
-  // credenciales que el resto, así que no se puede abrir la URL directa
-  // en el navegador sin pasar primero por nuestro propio backend).
   const attachments = f.attachment || [];
   if (attachments.length > 0) {
     wrap.appendChild(mk('div', { style: { fontSize: '11px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, [
@@ -2854,16 +2958,19 @@ function renderJiraDetailView() {
     wrap.appendChild(attachGrid);
   }
 
-  // ── Vínculo con AWX, si existe ──
   if (link) {
+    const linkedProfile = link.automationProfileId && state.config.automationProfiles && state.config.automationProfiles[link.automationProfileId];
     const linkBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '14px 16px', marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' } });
     linkBox.appendChild(mk('div', {
-      style: { fontSize: '12.5px', color: '#6ad17e', fontWeight: '600', cursor: 'pointer' },
+      style: { cursor: 'pointer' },
       onclick: () => {
         const tpl = state.awxTemplates.find((tplItem) => tplItem.id === link.templateId) || { id: link.templateId, name: link.templateName };
         openAwxDetail(tpl, 'jira-detail');
       },
-    }, [`→ ${link.templateName}`]));
+    }, [
+      mk('div', { style: { fontSize: '12.5px', color: '#6ad17e', fontWeight: '600' } }, [`→ ${link.templateName}`]),
+      linkedProfile ? mk('div', { style: { fontSize: '10.5px', color: '#5e6670', marginTop: '4px' } }, [`Automation: ${linkedProfile.name || link.automationProfileId}`]) : null,
+    ]));
     linkBox.appendChild(mk('button', {
       style: { background: '#dfe3e7', color: '#0a0b0d', border: 'none', borderRadius: '3px', padding: '6px 14px', fontSize: '12px', fontWeight: '700', cursor: 'pointer' },
       onclick: () => launchLinkedJob(issue.key),
@@ -2871,7 +2978,25 @@ function renderJiraDetailView() {
     wrap.appendChild(linkBox);
   }
 
-  // ── Comentarios existentes ──
+  const transitionBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '14px 16px', marginBottom: '16px' } });
+  transitionBox.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, ['Update Jira status']));
+  const transitionRow = mk('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } });
+  transitionRow.appendChild(mk('span', { style: { fontSize: '12px', color: '#dfe3e7' } }, [`Current: ${(f.status && f.status.name) || '—'}`]));
+  if (state.jiraTransitionsLoading) {
+    transitionRow.appendChild(mk('span', { style: { fontSize: '12px', color: '#5e6670' } }, ['Loading transitions…']));
+  } else if (state.jiraTransitions.length === 0) {
+    transitionRow.appendChild(mk('span', { style: { fontSize: '12px', color: '#5e6670' } }, ['No available transitions for your Jira permissions/workflow.']));
+  } else {
+    const select = mk('select', {
+      style: { background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '7px 10px', color: '#dfe3e7', fontSize: '12px' },
+      onchange: (e) => { if (e.target.value) transitionJiraIssue(e.target.value); },
+    }, [mk('option', { value: '' }, [state.jiraTransitionSending ? 'Updating…' : 'Choose transition…'])]);
+    state.jiraTransitions.forEach((tr) => select.appendChild(mk('option', { value: tr.id }, [tr.name])));
+    transitionRow.appendChild(select);
+  }
+  transitionBox.appendChild(transitionRow);
+  wrap.appendChild(transitionBox);
+
   const existingComments = (f.comment && f.comment.comments) || [];
   if (existingComments.length > 0) {
     wrap.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, [
@@ -2891,7 +3016,6 @@ function renderJiraDetailView() {
     wrap.appendChild(mk('div', { style: { marginBottom: '16px' } }));
   }
 
-  // ── Comentar ──
   const commentBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '18px', marginBottom: '16px' } });
   commentBox.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '6px' } }, [t('jira_detail_comment_label')]));
   const commentTextarea = mk('textarea', {
@@ -2916,7 +3040,6 @@ function renderJiraDetailView() {
   }, [state.jiraCommentSending ? t('jira_detail_comment_sending') : t('jira_detail_comment_send')]));
   wrap.appendChild(commentBox);
 
-  // ── Adjuntar reporte ──
   const attachBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '18px' } });
   const attachDisabled = state.jiraAttachSending || !state.awxStdout;
   attachBox.appendChild(mk('button', {
@@ -2927,6 +3050,14 @@ function renderJiraDetailView() {
     },
     onclick: () => { if (!attachDisabled) attachJobOutputToJira(); },
   }, [state.jiraAttachSending ? t('jira_detail_attach_sending') : '⊕ ' + t('jira_detail_attach_button')]));
+  attachBox.appendChild(mk('button', {
+    style: {
+      marginLeft: '8px', background: 'transparent', color: state.jiraAttachSending ? '#5e6670' : '#dfe3e7',
+      border: `1px solid ${state.jiraAttachSending ? '#22252a' : '#5e6670'}`, borderRadius: '3px', padding: '8px 20px',
+      fontSize: '13px', fontWeight: '600', cursor: state.jiraAttachSending ? 'not-allowed' : 'pointer',
+    },
+    onclick: () => { if (!state.jiraAttachSending) pickAndAttachJiraFile(); },
+  }, [state.jiraAttachSending ? t('jira_detail_attach_sending') : '⊕ Attach local file']));
   if (!state.awxStdout) {
     attachBox.appendChild(mk('p', { style: { fontSize: '11px', color: '#5e6670', marginTop: '8px' } }, [t('jira_detail_no_job_yet')]));
   }
@@ -2935,9 +3066,6 @@ function renderJiraDetailView() {
   return wrap;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CorexTerm — SSH/SFTP con sesiones cifradas, master password, xterm.js
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function loadCtSessions() {
   const res = await window.corexAPI.corextermListSessions();
@@ -3024,7 +3152,7 @@ function editSession(session) {
     port: session.port,
     username: session.username,
     authType: session.authType,
-    secret: '', // nunca se rellena de vuelta — si se deja vacío, se conserva el cifrado existente
+    secret: '', // never filled back in — leaving it empty preserves the existing encrypted value
     keyPath: '',
     folder: session.folder || '',
     useTunnel: !!session.tunnel,
@@ -3043,10 +3171,6 @@ async function pickKeyFileFor(target) {
   renderApp();
 }
 
-// ── Conexión y terminal interactivo ─────────────────────────────────────
-// Crea una instancia de xterm.js con la configuración/paleta común a SSH y
-// terminal local, la abre sobre el contenedor, y devuelve { term, fitAddon }.
-// El llamador se encarga de conectar el lado de datos (SSH o PTY local).
 function buildXtermInstance(container) {
   const term = new Terminal({
     cursorBlink: true,
@@ -3055,9 +3179,6 @@ function buildXtermInstance(container) {
     fontSize: 13,
     lineHeight: 1.3,
     scrollback: 5000,
-    // Paleta ANSI completa, coherente con el resto de COREX: verde/ámbar/rojo
-    // significan lo mismo aquí que en el resto de la app (éxito/aviso/error),
-    // en vez de los colores "de juguete" por defecto de xterm.js.
     theme: {
       background: '#0a0b0d',
       foreground: '#dfe3e7',
@@ -3090,8 +3211,6 @@ function buildXtermInstance(container) {
 }
 
 function writeWelcomeBanner(term, subtitle) {
-  // Reinterpreta el logo (franja diagonal + dos triángulos) con caracteres de
-  // bloque, ya que xterm.js pinta texto con color ANSI, no SVG.
   term.write('\x1b[38;2;223;227;231m  ▟▛   ▜▙\x1b[0m\r\n');
   term.write('\x1b[38;2;223;227;231m ▟▛ ▟▛▜▙ ▜▙\x1b[0m  \x1b[38;2;94;102;112mCOREX · CorexTerm\x1b[0m\r\n');
   term.write(`\x1b[38;2;223;227;231m▟▛       ▜▙\x1b[0m  \x1b[38;2;94;102;112m${subtitle}\x1b[0m\r\n\r\n`);
@@ -3104,23 +3223,12 @@ function openTerminalTab(terminalId, instanceData) {
   renderApp();
 }
 
-// Un terminal está visible si es el activo en modo single, o si ocupa
-// alguna celda del grid de split — el listener de resize y el fit solo
-// deben actuar sobre terminales que de verdad se están pintando.
 function isTerminalVisible(terminalId) {
   if (state.ctSplitMode === 'single') return state.ctActiveTerminalId === terminalId;
   return state.ctSplitSlots.includes(terminalId);
 }
 
-// Punto único de escritura de teclado hacia el backend. Si MultiExec/
-// Broadcast está activo y el terminal de origen es SSH, replicamos la
-// misma pulsación a TODAS las pestañas SSH abiertas (no a las locales —
-// enviar comandos de un host remoto a tu propia máquina no tiene sentido,
-// y sería fácil escribir algo destructivo sin darte cuenta).
 function writeToTerminal(sourceTerminalId, data) {
-  // Mientras se graba una macro, acumulamos lo que se teclea en el terminal
-  // activo — no en los que reciben broadcast, solo en el de origen, porque
-  // grabar es "lo que YO escribo", no lo que se replica a otros.
   if (state.ctRecordingMacro && sourceTerminalId === state.ctActiveTerminalId) {
     state.ctMacroBuffer += data;
   }
@@ -3142,8 +3250,6 @@ async function connectSession(session) {
   const terminalId = `term-${session.id}-${Date.now()}`;
   openTerminalTab(terminalId, { kind: 'ssh', session, connected: false, term: null, fitAddon: null, label: session.name });
 
-  // El elemento DOM del terminal ya existe tras el renderApp anterior;
-  // inicializamos xterm.js sobre él.
   requestAnimationFrame(() => {
     const container = document.getElementById(`xterm-container-${terminalId}`);
     if (!container || typeof Terminal === 'undefined') {
@@ -3178,9 +3284,6 @@ async function connectSession(session) {
       renderApp();
     });
 
-    // SFTP en paralelo, listo para cuando el usuario abra el panel — no se
-    // muestra automáticamente, solo se conecta para que abrir el panel sea
-    // instantáneo en vez de tener que esperar una nueva conexión.
     window.corexAPI.corextermSftpConnect(session.id).then((res) => {
       if (state.ctTerminalInstances[terminalId]) {
         state.ctTerminalInstances[terminalId].sftpReady = !!res.ok;
@@ -3189,8 +3292,6 @@ async function connectSession(session) {
   });
 }
 
-// Terminal local: shell de la propia máquina del usuario (bash/zsh/PowerShell),
-// sin pasar por SSH — lo que MobaXterm llama "Local terminal".
 async function connectLocalTerminal() {
   const terminalId = `local-${Date.now()}`;
   openTerminalTab(terminalId, { kind: 'local', session: null, connected: false, term: null, fitAddon: null, label: 'Local' });
@@ -3234,8 +3335,6 @@ async function connectLocalTerminal() {
 function switchToTab(terminalId) {
   state.ctActiveTerminalId = terminalId;
   renderApp();
-  // El fit hay que recalcularlo tras el cambio de pestaña, porque el
-  // contenedor estuvo oculto/destruido y sus dimensiones pueden no coincidir.
   requestAnimationFrame(() => {
     const inst = state.ctTerminalInstances[terminalId];
     if (inst && inst.fitAddon) {
@@ -3245,7 +3344,6 @@ function switchToTab(terminalId) {
   });
 }
 
-// ── Split screen — igual que el botón "Split" de MobaXterm ──────────────
 const SPLIT_SLOT_COUNT = { single: 1, h2: 2, v2: 2, grid4: 4 };
 
 function refitAllSplitSlots() {
@@ -3264,8 +3362,6 @@ function refitAllSplitSlots() {
 function setSplitMode(mode) {
   state.ctSplitMode = mode;
   const slotCount = SPLIT_SLOT_COUNT[mode];
-  // Al pasar a split, la primera celda hereda la pestaña activa actual, para
-  // no perder de vista lo que estabas mirando.
   const slots = [null, null, null, null];
   if (mode !== 'single' && state.ctActiveTerminalId) {
     slots[0] = state.ctActiveTerminalId;
@@ -3290,21 +3386,16 @@ async function closeTab(terminalId) {
     if (inst.kind === 'ssh' && inst.session) window.corexAPI.corextermSftpDisconnect(inst.session.id);
   }
   if (state.ctSftpOpenFor === terminalId) state.ctSftpOpenFor = null;
-  // Si este terminal estaba asignado a alguna celda de split, la vaciamos.
   state.ctSplitSlots = state.ctSplitSlots.map((id) => (id === terminalId ? null : id));
   delete state.ctTerminalInstances[terminalId];
   state.ctOpenTerminalIds = state.ctOpenTerminalIds.filter((id) => id !== terminalId);
 
   if (state.ctActiveTerminalId === terminalId) {
-    // Al cerrar la pestaña activa, mostramos la anterior si existe, o
-    // volvemos a la lista de sesiones si no quedan pestañas abiertas.
     state.ctActiveTerminalId = state.ctOpenTerminalIds.length > 0
       ? state.ctOpenTerminalIds[state.ctOpenTerminalIds.length - 1]
       : null;
   }
 
-  // MultiExec deja de tener sentido (y de tener efecto) con menos de 2
-  // pestañas SSH — lo desactivamos para que no quede "armado" en silencio.
   const remainingSsh = state.ctOpenTerminalIds.filter((id) => {
     const i = state.ctTerminalInstances[id];
     return i && i.kind === 'ssh';
@@ -3314,9 +3405,6 @@ async function closeTab(terminalId) {
   renderApp();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  SFTP — panel lateral dentro de una pestaña SSH, como en MobaXterm
-// ═══════════════════════════════════════════════════════════════════════════
 
 function toggleSftpPanel(terminalId) {
   const inst = state.ctTerminalInstances[terminalId];
@@ -3329,7 +3417,6 @@ function toggleSftpPanel(terminalId) {
     loadSftpDir(inst.session.id, '.');
   }
   renderApp();
-  // El terminal pierde ancho al abrirse el panel — hay que recalcular el fit.
   requestAnimationFrame(() => {
     if (inst.fitAddon) {
       inst.fitAddon.fit();
@@ -3349,8 +3436,6 @@ async function loadSftpDir(sessionId, remotePath) {
     state.ctSftpError = res.error;
   } else {
     state.ctSftpPath = remotePath;
-    // Carpetas primero, luego archivos, ambos alfabéticos — más fácil de
-    // escanear visualmente que el orden crudo que devuelve el servidor.
     state.ctSftpEntries = res.entries
       .filter((e) => e.name !== '.')
       .sort((a, b) => {
@@ -3414,7 +3499,6 @@ async function createSftpFolder(sessionId) {
   else loadSftpDir(sessionId, state.ctSftpPath);
 }
 
-// ── Editor remoto inline — doble-click en un archivo abre esto ──────────
 async function openRemoteFileEditor(sessionId, remotePath) {
   const res = await window.corexAPI.corextermSftpReadFile(sessionId, remotePath);
   if (!res.ok) {
@@ -3450,7 +3534,6 @@ function closeRemoteFileEditor() {
   renderApp();
 }
 
-// ── Macros — grabar/reproducir secuencias de teclas ─────────────────────
 async function loadCtMacros() {
   const res = await window.corexAPI.corextermListMacros();
   if (res.ok) state.ctMacros = res.macros;
@@ -3486,16 +3569,11 @@ function stopRecordingMacro() {
   });
 }
 
-// Reproduce la macro en el terminal activo — exactamente la idea de
-// MobaXterm: grabas en un servidor, repites en otros, sin volver a teclear.
 function playMacro(macro) {
   if (!state.ctActiveTerminalId) {
     toast('Open a terminal first', 'err');
     return;
   }
-  // Pasa por writeToTerminal a propósito: si MultiExec está activo, la
-  // macro se reproduce en todas las pestañas SSH abiertas, no solo en la
-  // activa — es el caso de uso típico ("ejecuta esto en todos los servidores").
   writeToTerminal(state.ctActiveTerminalId, macro.keys);
 }
 
@@ -3512,7 +3590,6 @@ function toggleMacroPanel() {
 }
 
 function setupCorextermListeners() {
-  // Se registra una sola vez; despacha por terminalId a la instancia correcta.
   window.corexAPI.onCorextermData(({ terminalId, data }) => {
     const inst = state.ctTerminalInstances[terminalId];
     if (inst && inst.term) inst.term.write(data);
@@ -3536,17 +3613,11 @@ function renderCorexTermView() {
   wrap.appendChild(mk('h1', { style: { fontSize: '22px', fontWeight: '700', marginBottom: '4px', color: '#dfe3e7' } }, ['CorexTerm']));
   wrap.appendChild(mk('p', { style: { fontSize: '13px', color: '#5e6670', marginBottom: '16px' } }, ['SSH / SFTP sessions, encrypted with your master password.']));
 
-  // El vault global ya garantiza que llegamos aquí desbloqueados — no hay
-  // gate propio de CorexTerm. Si por algún motivo se cerrara entre medias,
-  // mostramos un aviso simple en vez de un formulario duplicado.
   if (!state.vaultUnlocked) {
     wrap.appendChild(mk('div', { style: { fontSize: '13px', color: '#c98a3a' } }, ['Vault is locked. Please restart COREX.']));
     return wrap;
   }
 
-  // La barra de pestañas se muestra siempre que haya al menos una conexión
-  // abierta, como en un navegador — persiste aunque navegues a la lista de
-  // sesiones o al formulario, no solo mientras ves un terminal en concreto.
   if (hasOpenTabs) {
     wrap.appendChild(renderCtTabBar());
   }
@@ -3569,8 +3640,6 @@ function renderCorexTermView() {
   return wrap;
 }
 
-// Barra de pestañas horizontal, estilo navegador: una por cada terminal
-// abierto (SSH o local), con su estado de conexión y botón de cierre.
 function renderCtTabBar() {
   const bar = mk('div', { style: { display: 'flex', gap: '2px', marginBottom: '0', borderBottom: '1px solid #22252a', overflowX: 'auto' } });
 
@@ -3606,15 +3675,11 @@ function renderCtTabBar() {
     bar.appendChild(tab);
   });
 
-  // "+" para abrir una nueva pestaña — vuelve a la lista de sesiones sin
-  // cerrar las pestañas ya abiertas, igual que un navegador.
   bar.appendChild(mk('div', {
     style: { display: 'flex', alignItems: 'center', padding: '7px 12px', cursor: 'pointer', color: '#5e6670', fontSize: '14px' },
     onclick: () => { state.ctActiveTerminalId = null; renderApp(); },
   }, ['+']));
 
-  // Controles de split — igual que el botón "Split" de MobaXterm: alternar
-  // entre vista única, 2 paneles (horizontal/vertical) o grid de 4.
   const splitGroup = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '4px', marginLeft: 'auto', paddingRight: '4px' } });
   const splitButtons = [
     { mode: 'single', label: '▭', title: 'Single' },
@@ -3635,9 +3700,6 @@ function renderCtTabBar() {
     }, [btn.label]));
   });
 
-  // MultiExec / Broadcast — toggle con color de aviso fuerte cuando está
-  // activo, porque escribir a varias sesiones SSH a la vez por descuido es
-  // exactamente el tipo de error que puede doler en producción.
   const sshTabCount = state.ctOpenTerminalIds.filter((id) => {
     const inst = state.ctTerminalInstances[id];
     return inst && inst.kind === 'ssh';
@@ -3654,7 +3716,6 @@ function renderCtTabBar() {
     onclick: () => { if (sshTabCount > 1) { state.ctBroadcastMode = !state.ctBroadcastMode; renderApp(); } },
   }, ['MultiExec']));
 
-  // Macros — grabar/parar y abrir el panel de macros guardadas.
   splitGroup.appendChild(mk('span', {
     style: {
       fontSize: '11px', fontWeight: '700', padding: '4px 9px', cursor: 'pointer',
@@ -3763,9 +3824,6 @@ function renderCtSessionList() {
     return wrap;
   }
 
-  // Agrupamos por carpeta — las sesiones sin carpeta van sueltas, sin
-  // sección, directamente en la lista (no tiene sentido un grupo "Ungrouped"
-  // si la mayoría de tus sesiones no usan carpetas).
   const grouped = {};
   const ungrouped = [];
   state.ctSessions.forEach((s) => {
@@ -3852,8 +3910,6 @@ function renderCtSessionForm() {
     (v) => { form.username = v; }, (v) => { form.authType = v; }, (v) => { form.secret = v; }, (v) => { form.keyPath = v; }
   ));
 
-  // Carpeta opcional, para agrupar sesiones en la lista (p.ej. "Production",
-  // "Client X") — con autocompletado de las carpetas ya usadas.
   const existingFolders = Array.from(new Set(state.ctSessions.map((s) => s.folder).filter(Boolean)));
   const folderField = mk('div', { style: { marginBottom: '10px' } });
   folderField.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, ['Folder (optional)']));
@@ -3899,11 +3955,6 @@ function renderCtSessionForm() {
   return wrap;
 }
 
-// Grid de split screen: 2 o 4 celdas, cada una puede mostrar cualquiera de
-// las pestañas abiertas (o quedar vacía con un selector). A diferencia del
-// modo single, aquí SÍ pueden estar reabiertos varios `term` a la vez, cada
-// uno en su propio contenedor DOM — por eso el id de cada contenedor es por
-// índice de celda, no por terminalId.
 function renderCtSplitGrid() {
   const mode = state.ctSplitMode;
   const slotCount = SPLIT_SLOT_COUNT[mode];
@@ -3930,7 +3981,6 @@ function renderSplitCell(slotIndex) {
   const wrap = mk('div', { style: { display: 'flex', flexDirection: 'column', minHeight: '0', border: '1px solid #22252a', borderRadius: '3px', overflow: 'hidden' } });
 
   if (!terminalId) {
-    // Celda vacía: selector para asignar cualquiera de las pestañas abiertas.
     const empty = mk('div', { style: { flex: '1', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0d0e10', gap: '8px' } });
     empty.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670' } }, ['Choose a terminal']));
     state.ctOpenTerminalIds.forEach((id) => {
@@ -3967,10 +4017,6 @@ function renderSplitCell(slotIndex) {
   });
   wrap.appendChild(container);
 
-  // Reabrimos el term existente sobre el contenedor de ESTA celda. Como cada
-  // celda tiene su propio contenedor (por índice, no por terminalId), el
-  // mismo terminal puede pasar de la vista single a una celda de split sin
-  // perder su buffer ni su conexión — solo cambia dónde se pinta.
   if (inst && inst.term) {
     requestAnimationFrame(() => {
       const freshContainer = document.getElementById(`xterm-container-${cellId}`);
@@ -4012,7 +4058,6 @@ function renderCtActiveTerminal() {
     titleText,
     !connected ? mk('span', { style: { fontSize: '11px', color: '#c98a3a', marginLeft: '10px', fontWeight: '500' } }, ['connecting...']) : null,
   ].filter(Boolean)));
-  // SFTP solo tiene sentido para sesiones SSH, no para el shell local.
   if (isSsh) {
     headerRow.appendChild(mk('button', {
       style: {
@@ -4024,8 +4069,6 @@ function renderCtActiveTerminal() {
   }
   wrap.appendChild(headerRow);
 
-  // Cuerpo: terminal a la izquierda, panel SFTP a la derecha si está abierto
-  // — igual que el navegador SSH de MobaXterm al lado del terminal.
   const bodyRow = mk('div', { style: { flex: '1', display: 'flex', minHeight: '420px' } });
 
   const container = mk('div', {
@@ -4042,11 +4085,6 @@ function renderCtActiveTerminal() {
   }
   wrap.appendChild(bodyRow);
 
-  // renderApp() reconstruye TODO el DOM en cada render, así que el contenedor
-  // de arriba es siempre un nodo nuevo. Si ya existe una instancia de
-  // Terminal para este terminalId (porque venimos de otra vista y volvemos),
-  // la reabrimos sobre el contenedor nuevo en vez de perderla — xterm.js
-  // soporta re-open() conservando el buffer y la conexión sigue viva en main.
   if (inst && inst.term) {
     requestAnimationFrame(() => {
       const freshContainer = document.getElementById(`xterm-container-${terminalId}`);
@@ -4172,14 +4210,9 @@ function renderRemoteFileEditorModal() {
   return overlay;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  VS Corex — editor Monaco, explorador local/remoto, Git
-// ═══════════════════════════════════════════════════════════════════════════
 
 let monacoInitPromise = null;
 
-// Carga Monaco vía su loader AMD, una sola vez por sesión de la app. Devuelve
-// una promesa que resuelve cuando window.monaco está listo para usarse.
 function ensureMonacoLoaded() {
   if (monacoInitPromise) return monacoInitPromise;
   monacoInitPromise = new Promise((resolve, reject) => {
@@ -4206,7 +4239,6 @@ async function initVsCorex() {
   }
 }
 
-// ── Abrir workspace ──────────────────────────────────────────────────────
 async function openLocalWorkspace() {
   const res = await window.corexAPI.vscorexPickFolder();
   if (!res.ok) return;
@@ -4219,8 +4251,6 @@ async function openLocalWorkspace() {
   renderApp();
 }
 
-// Abre como workspace la raíz SFTP de una sesión de CorexTerm ya guardada —
-// reusa exactamente las mismas sesiones, no hace falta configurarlas dos veces.
 async function openRemoteWorkspace(session) {
   state.vsWorkspaceKind = 'remote';
   state.vsWorkspaceRoot = '.';
@@ -4244,7 +4274,6 @@ function closeWorkspace() {
   renderApp();
 }
 
-// ── Árbol de explorador (local o remoto, misma forma de datos) ──────────
 async function loadExplorerDir(dirPath) {
   let res;
   if (state.vsWorkspaceKind === 'remote') {
@@ -4272,7 +4301,6 @@ function toggleExplorerDir(entryPath) {
 }
 
 
-// ── Pestañas de editor — abrir/cerrar/guardar archivos ──────────────────
 function fileTabId(entryPath) {
   return `${state.vsWorkspaceKind}:${state.vsWorkspaceSessionId || ''}:${entryPath}`;
 }
@@ -4348,9 +4376,6 @@ async function saveActiveFile() {
   renderApp();
 }
 
-// Detecta el lenguaje de Monaco a partir de la extensión — cobertura de los
-// casos que de verdad usaríamos (Ansible/YAML, Python, JS, shell, etc.),
-// no un mapeo exhaustivo de los 100+ lenguajes que soporta Monaco.
 function languageForFile(name) {
   const ext = name.split('.').pop().toLowerCase();
   const map = {
@@ -4512,7 +4537,6 @@ function renderVsWelcome() {
 function renderVsWorkbench() {
   const wrap = mk('div', { style: { flex: '1', display: 'flex', flexDirection: 'column', minHeight: '0' } });
 
-  // Barra superior: ruta del workspace + acciones globales
   const topBar = mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 14px', borderBottom: '1px solid #22252a' } });
   topBar.appendChild(mk('div', { style: { fontSize: '11.5px', color: '#5e6670', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, [
     state.vsWorkspaceKind === 'remote' ? `Remote: ${state.vsWorkspaceRoot}` : state.vsWorkspaceRoot,
@@ -4541,10 +4565,8 @@ function renderVsWorkbench() {
   // Columna 1: explorador
   body.appendChild(renderVsExplorer());
 
-  // Columna 2: pestañas + editor Monaco
   body.appendChild(renderVsEditorArea());
 
-  // Columna 3: panel de Git (solo si está abierto)
   if (state.vsGitPanelOpen && state.vsWorkspaceKind === 'local') {
     body.appendChild(renderVsGitPanel());
   }
@@ -4589,12 +4611,6 @@ function renderExplorerEntries(container, entries, parentPath, depth) {
 }
 
 
-// ── Área de editor: pestañas + instancia única de Monaco ────────────────
-// A diferencia de xterm.js (una instancia de Terminal por pestaña), aquí
-// usamos UNA sola instancia de editor Monaco que reutilizamos para todas
-// las pestañas, cambiándole el "model" (el documento) al cambiar de
-// pestaña — es el patrón estándar de Monaco para editores con tabs, mucho
-// más barato que crear un editor.create() por archivo abierto.
 let monacoEditorInstance = null;
 
 function renderVsEditorArea() {
@@ -4607,7 +4623,6 @@ function renderVsEditorArea() {
     return wrap;
   }
 
-  // Barra de pestañas de archivos abiertos
   const tabBar = mk('div', { style: { display: 'flex', borderBottom: '1px solid #22252a', overflowX: 'auto' } });
   state.vsOpenFiles.forEach((file) => {
     const active = state.vsActiveFileId === file.id;
@@ -4631,7 +4646,6 @@ function renderVsEditorArea() {
   });
   wrap.appendChild(tabBar);
 
-  // Barra de acción del archivo activo
   const activeFile = state.vsOpenFiles.find((f) => f.id === state.vsActiveFileId);
   const actionBar = mk('div', { style: { display: 'flex', justifyContent: 'flex-end', padding: '6px 10px', borderBottom: '1px solid #22252a' } });
   actionBar.appendChild(mk('button', {
@@ -4640,7 +4654,6 @@ function renderVsEditorArea() {
   }, ['Save']));
   wrap.appendChild(actionBar);
 
-  // Contenedor del editor Monaco — único, persistente entre renders.
   const editorContainer = mk('div', { id: 'monaco-container', style: { flex: '1', minHeight: '0' } });
   wrap.appendChild(editorContainer);
 
@@ -4655,11 +4668,6 @@ function mountMonacoForActiveFile() {
   const file = state.vsOpenFiles.find((f) => f.id === state.vsActiveFileId);
   if (!file) return;
 
-  // Si el editor ya existe pero su nodo DOM fue destruido por un renderApp()
-  // anterior (siempre pasa, reconstruimos todo el DOM en cada render), lo
-  // recreamos sobre el contenedor nuevo — Monaco no tiene un "re-open()"
-  // como xterm.js, así que en vez de mover el editor, lo recreamos y le
-  // reasignamos el modelo del archivo activo, que sí persiste en memoria.
   if (!monacoEditorInstance || !document.body.contains(monacoEditorInstance.getDomNode())) {
     monacoEditorInstance = monaco.editor.create(container, {
       theme: 'vs-dark',
@@ -4686,7 +4694,6 @@ function mountMonacoForActiveFile() {
 }
 
 
-// ── Panel de Git ─────────────────────────────────────────────────────────
 function renderVsGitPanel() {
   const panel = mk('div', { style: { width: '300px', flexShrink: '0', borderLeft: '1px solid #22252a', overflowY: 'auto', padding: '12px' } });
   const s = state.vsGitStatus;
@@ -4696,7 +4703,6 @@ function renderVsGitPanel() {
     return panel;
   }
 
-  // Diff inline si hay uno seleccionado
   if (state.vsGitDiffFile) {
     panel.appendChild(mk('div', { style: { display: 'flex', justifyContent: 'space-between', marginBottom: '8px' } }, [
       mk('span', { style: { fontSize: '11.5px', color: '#dfe3e7', fontWeight: '700', overflow: 'hidden', textOverflow: 'ellipsis' } }, [state.vsGitDiffFile]),
