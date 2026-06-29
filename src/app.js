@@ -1896,6 +1896,10 @@ function settingsSection(title, children) {
 }
 
 async function saveSettings() {
+  if (state.automationProfilesJson != null) {
+    try { state.config.automationProfiles = JSON.parse(state.automationProfilesJson || '{}'); }
+    catch (e) { toast(`Invalid automation profiles JSON: ${e.message}`, 'err'); return; }
+  }
   await window.corexAPI.setConfig(state.config);
   toast(t('settings_saved_toast'), 'ok');
   // Refresh dependent views
