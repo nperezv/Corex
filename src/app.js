@@ -354,25 +354,35 @@ function renderSidebar() {
 
   const sections = [
     {
-      label: 'Operations',
+      label: 'Operate',
       items: [
-        { id: 'inbox', label: t('nav_inbox'), icon: '◧' },
-        { id: 'awx', label: t('nav_awx'), iconSvg: iconAwx },
-        { id: 'jira', label: t('nav_jira'), iconSvg: iconJira, badge: state.inboxIssues.length || null },
+        { id: 'inbox', label: 'Cockpit', icon: '⬢' },
+        { id: 'jira', label: 'My Work', iconSvg: iconJira, badge: state.inboxIssues.length || null },
       ],
     },
     {
-      label: 'Workspace',
+      label: 'Automate',
+      items: [
+        { id: 'awx', label: 'AWX Templates', iconSvg: iconAwx },
+        { id: 'templates', label: 'Jobs & Templates', iconSvg: iconTemplates, badge: state.pendingAttachments.length || null },
+      ],
+    },
+    {
+      label: 'Connect',
       items: [
         { id: 'corexterm', label: 'CorexTerm', iconSvg: iconCorexterm },
+      ],
+    },
+    {
+      label: 'Build',
+      items: [
         { id: 'vscorex', label: 'VS Corex', iconSvg: iconVsCorex },
       ],
     },
     {
-      label: 'System',
+      label: 'Configure',
       items: [
-        { id: 'templates', label: 'Templates', iconSvg: iconTemplates, badge: state.pendingAttachments.length || null },
-        { id: 'settings', label: t('nav_settings'), icon: '⚒' },
+        { id: 'settings', label: t('nav_settings'), icon: '⚙' },
       ],
     },
   ];
@@ -385,13 +395,13 @@ function renderSidebar() {
 
   const nav = mk('div', {
     style: {
-      width: '200px',
+      width: '230px',
       height: '100%',
-      background: C.surface0,
-      borderRight: `1px solid ${C.border}`,
+      background: 'linear-gradient(180deg, #07131f 0%, #08111b 55%, #071018 100%)',
+      borderRight: '1px solid #1b2a3a',
       display: 'flex',
       flexDirection: 'column',
-      padding: `${S[5]} 0`,
+      padding: '14px 12px',
       flexShrink: '0',
       position: 'relative',
       overflow: 'hidden',
@@ -426,13 +436,12 @@ function renderSidebar() {
   // ancho que lo volvía ilegible (probado y descartado: comprimir el texto
   // al ancho de un logo de 18px rompía la legibilidad).
   const brand = mk('div', {
-    style: { padding: `${S[5]} ${S[5]} ${S[6]}`, textAlign: 'center', color: C.textPrimary },
+    style: { padding: '10px 10px 18px', display: 'flex', alignItems: 'center', gap: '12px', color: C.textPrimary },
   }, [
-    mk('div', { style: {}, html: brandLogoSvg }),
+    mk('div', { style: { color: C.success, flexShrink: '0' }, html: brandLogoSvg }),
     mk('span', {
       style: {
-        fontSize: '13px', fontWeight: '100', color: C.textPrimary, letterSpacing: '1.5px',
-        display: 'inline-block', transform: 'scaleY(0.70)',
+        fontSize: '18px', fontWeight: '700', color: C.textPrimary, letterSpacing: '0.8px',
       },
     }, ['COREX']),
   ]);
@@ -441,8 +450,8 @@ function renderSidebar() {
   sections.forEach((section) => {
     content.appendChild(mk('div', {
       style: {
-        fontSize: '9px', color: '#4b5158', textTransform: 'uppercase', letterSpacing: '0.8px',
-        fontWeight: '700', padding: `0 ${S[5]}`, marginBottom: S[1], marginTop: S[4],
+        fontSize: '11px', color: '#9aa7b5', letterSpacing: '0.2px',
+        fontWeight: '700', padding: '12px 10px 8px', marginBottom: '0', marginTop: '4px',
       },
     }, [section.label]));
 
@@ -453,13 +462,16 @@ function renderSidebar() {
           display: 'flex',
           alignItems: 'center',
           gap: S[2],
-          padding: `${S[2]} ${S[5]}`,
+          padding: '10px 12px',
           cursor: 'pointer',
-          color: active ? C.textPrimary : '#8b9197',
-          background: active ? C.surface2 : 'transparent',
-          borderLeft: active ? `2px solid ${C.success}` : '2px solid transparent',
+          color: active ? '#f8fbff' : '#a8b3bf',
+          background: active ? 'linear-gradient(90deg, rgba(22,163,74,0.25), rgba(20,30,45,0.86))' : 'rgba(12,24,36,0.72)',
+          border: active ? '1px solid rgba(34,197,94,0.35)' : '1px solid rgba(31,48,66,0.7)',
+          borderLeft: active ? `3px solid ${C.success}` : '3px solid transparent',
+          borderRadius: '8px',
+          marginBottom: '6px',
           fontSize: T.base,
-          fontWeight: active ? '600' : '500',
+          fontWeight: active ? '700' : '500',
           position: 'relative',
         },
         onclick: () => {
@@ -510,12 +522,15 @@ function renderSidebar() {
   // siempre sin tener que ir a Settings a comprobarlo.
   content.appendChild(mk('div', {
     style: {
-      marginTop: 'auto', padding: `${S[3]} ${S[5]}`, borderTop: `1px solid ${C.surface2}`,
+      marginTop: 'auto', padding: '12px', border: '1px solid #1f3042', borderRadius: '10px', background: '#0d1b28',
       display: 'flex', alignItems: 'center', gap: S[2],
     },
   }, [
     mk('span', { style: { width: '6px', height: '6px', borderRadius: '50%', background: C.success, flexShrink: '0', display: 'inline-block' } }),
-    mk('span', { style: { fontSize: '10.5px', color: C.textSecondary } }, ['Vault unlocked']),
+    mk('div', { style: { display: 'flex', flexDirection: 'column', minWidth: '0' } }, [
+      mk('span', { style: { fontSize: '12px', color: C.textPrimary, fontWeight: '700' } }, ['Nelson Perez']),
+      mk('span', { style: { fontSize: '10.5px', color: C.textSecondary } }, [state.vaultUnlocked ? 'Vault unlocked' : 'Vault locked']),
+    ]),
   ]));
 
   nav.appendChild(content);
@@ -618,6 +633,70 @@ function dismissPersistentBanner(id) {
   renderApp();
 }
 
+function currentViewTitle() {
+  const titles = {
+    inbox: 'Operations Cockpit',
+    awx: 'AWX Templates',
+    'awx-detail': 'Automation Detail',
+    jira: 'My Work',
+    'jira-detail': 'Ticket Detail',
+    corexterm: 'CorexTerm',
+    vscorex: 'VS Corex',
+    templates: 'Jobs & Templates',
+    settings: 'Settings',
+  };
+  return titles[state.view] || 'COREX';
+}
+
+function renderShellStatusCard(label, value, ok, onClick) {
+  return mk('button', {
+    style: {
+      minWidth: '112px', height: '42px', border: '1px solid #1f3042', borderRadius: '8px',
+      background: '#0d1d2b', color: C.textPrimary, display: 'flex', flexDirection: 'column',
+      justifyContent: 'center', alignItems: 'flex-start', padding: '7px 12px', cursor: onClick ? 'pointer' : 'default',
+    },
+    onclick: onClick,
+  }, [
+    mk('span', { style: { fontSize: T.sm, fontWeight: '700' } }, [label]),
+    mk('span', { style: { fontSize: T.xs, color: ok ? C.success : C.warning, marginTop: '2px' } }, [value]),
+  ]);
+}
+
+function renderShellHeader() {
+  const header = mk('div', {
+    style: {
+      height: '66px', display: 'flex', alignItems: 'center', gap: S[4], padding: '0 24px',
+      borderBottom: '1px solid #1b2a3a', background: 'rgba(7, 16, 25, 0.78)', backdropFilter: 'blur(18px)', flexShrink: '0',
+    },
+  });
+
+  header.appendChild(mk('div', { style: { minWidth: '230px' } }, [
+    mk('div', { style: { fontSize: T.lg, fontWeight: '700', color: C.textPrimary } }, [currentViewTitle()]),
+    mk('div', { style: { fontSize: T.xs, color: C.textSecondary, marginTop: '3px' } }, ['Mission control for infrastructure operations']),
+  ]));
+
+  const search = mk('input', {
+    type: 'search', placeholder: 'Search ticket key and press Enter…', 'data-focus-key': 'shell-search',
+    style: {
+      flex: '1', minWidth: '220px', maxWidth: '560px', height: '40px', border: '1px solid #203249',
+      borderRadius: R.pill, background: '#08131f', color: C.textPrimary, padding: '0 16px', outline: 'none',
+    },
+    onkeydown: (e) => {
+      if (e.key === 'Enter' && e.target.value.trim()) openJiraDetail(e.target.value.trim().toUpperCase(), state.view);
+    },
+  });
+  header.appendChild(search);
+
+  header.appendChild(renderShellStatusCard('Jira', state.config.jira && state.config.jira.url ? `${state.inboxIssues.length} issues` : 'Setup needed', !!(state.config.jira && state.config.jira.url), () => { state.view = 'jira'; renderApp(); if (state.inboxIssues.length === 0) loadInbox(); }));
+  header.appendChild(renderShellStatusCard('AWX', state.config.awx && state.config.awx.url ? `${state.awxTemplates.length} templates` : 'Setup needed', !!(state.config.awx && state.config.awx.url), () => { state.view = 'awx'; renderApp(); loadAwxRecentJobs(); }));
+  header.appendChild(renderShellStatusCard('Vault', state.vaultUnlocked ? 'Unlocked' : 'Locked', state.vaultUnlocked, () => { state.view = 'settings'; renderApp(); }));
+  header.appendChild(renderShellStatusCard('SSH', `${state.ctOpenTerminalIds.length} active`, state.ctOpenTerminalIds.length > 0, () => { state.view = 'corexterm'; renderApp(); }));
+
+  header.appendChild(mk('div', { style: { width: '34px', height: '34px', borderRadius: '50%', background: 'linear-gradient(135deg,#2b3a4b,#172332)', border: '1px solid #2d4055', display: 'grid', placeItems: 'center', color: C.textPrimary, fontSize: T.sm, fontWeight: '700' } }, ['NP']));
+
+  return header;
+}
+
 function renderApp() {
   const app = document.getElementById('app');
 
@@ -680,32 +759,16 @@ function renderApp() {
 
   app.innerHTML = '';
 
-  if (state.view === 'inbox') {
-    const cockpit = renderOperationsCockpit();
-    app.appendChild(cockpit);
-
-    const t = renderToast();
-    if (t) app.appendChild(t);
-
-    const connectivityBanner = renderConnectivityBanner();
-    if (connectivityBanner) app.appendChild(connectivityBanner);
-
-    const banners = renderPersistentBanners();
-    if (banners) app.appendChild(banners);
-
-    if (state.showPendingAttachmentsModal) {
-      app.appendChild(renderPendingAttachmentsModal());
-    }
-    return;
-  }
-
-  const layout = mk('div', { style: { display: 'flex', height: '100%' } });
+  const layout = mk('div', { style: { display: 'flex', height: '100%', background: 'radial-gradient(circle at 75% 0%, #111b2f 0%, #08121d 42%, #050a10 100%)' } });
   layout.appendChild(renderSidebar());
+
+  const workspace = mk('div', { style: { flex: '1', minWidth: '0', display: 'flex', flexDirection: 'column' } });
+  workspace.appendChild(renderShellHeader());
 
   const main = mk('div', {
     id: 'corex-main-scroll',
     'data-view': state.view,
-    style: { flex: '1', overflowY: 'auto', padding: '32px 40px' },
+    style: { flex: '1', overflowY: 'auto', padding: '24px', minWidth: '0' },
   });
 
   if (state.view === 'inbox') main.appendChild(renderInboxView());
@@ -718,7 +781,8 @@ function renderApp() {
   else if (state.view === 'templates') main.appendChild(renderTemplatesView());
   else if (state.view === 'settings') main.appendChild(renderSettingsView());
 
-  layout.appendChild(main);
+  workspace.appendChild(main);
+  layout.appendChild(workspace);
   app.appendChild(layout);
   main.scrollTop = prevScrollTop;
 
@@ -830,6 +894,7 @@ async function loadAllAfterUnlock() {
   }
   if (state.config.awx && state.config.awx.url) {
     loadAwxTemplates();
+    loadAwxRecentJobs();
   }
 }
 
@@ -2954,53 +3019,131 @@ function renderTopTicketsSection() {
   return wrap;
 }
 
-function renderSparkline(color = '#22c55e') {
-  return `<svg viewBox="0 0 120 28" class="spark" aria-hidden="true"><polyline points="2,20 14,18 26,21 36,12 48,16 58,9 70,14 82,7 94,10 106,3 118,5" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+function renderDashboardMetricCard(label, value, sublabel, accentColor, onClick) {
+  return mk('div', {
+    style: {
+      background: C.surface1,
+      border: `1px solid ${C.border}`,
+      borderLeft: `3px solid ${accentColor}`,
+      borderRadius: R.sm,
+      padding: S[4],
+      minHeight: '92px',
+      cursor: onClick ? 'pointer' : 'default',
+      display: 'flex',
+      flexDirection: 'column',
+      justifyContent: 'space-between',
+    },
+    onclick: onClick,
+  }, [
+    mk('div', { style: { fontSize: T.sm, color: C.textSecondary, fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.5px' } }, [label]),
+    mk('div', { style: { fontSize: '26px', lineHeight: '1', color: C.textPrimary, fontWeight: '700' } }, [String(value)]),
+    mk('div', { style: { fontSize: T.sm, color: C.textSecondary } }, [sublabel]),
+  ]);
 }
 
-function renderOperationsCockpit() {
-  const wrap = mk('div', { class: 'ops-cockpit-shell' });
-  wrap.innerHTML = `
-    <aside class="ops-sidebar">
-      <div class="ops-brand"><span class="ops-logo-mark">◆◆</span><strong>COREX</strong></div>
-      <div class="ops-nav-group active"><div class="ops-nav-title">⬢ Operate <span>⌃</span></div><div class="ops-nav-item selected" data-view="inbox">☄ Cockpit</div><div class="ops-nav-item" data-view="jira">♮ My Work</div></div>
-      <div class="ops-nav-group"><div class="ops-nav-title">⬡ Automate <span>⌃</span></div><div class="ops-nav-item" data-view="awx">◇ AWX Templates</div><div class="ops-nav-item" data-view="awx">▣ Jobs</div></div>
-      <div class="ops-nav-group"><div class="ops-nav-title">♧ Connect <span>⌃</span></div><div class="ops-nav-item" data-view="corexterm">▤ CorexTerm</div><div class="ops-nav-item" data-view="corexterm">⌘ Sessions</div></div>
-      <div class="ops-nav-group"><div class="ops-nav-title">▣ Build <span>⌃</span></div><div class="ops-nav-item" data-view="vscorex">♨ VS Corex</div><div class="ops-nav-item" data-view="vscorex">⌘ Workspaces</div></div>
-      <div class="ops-nav-group"><div class="ops-nav-title">⚙ Configure <span>⌃</span></div><div class="ops-nav-item" data-view="settings">⚙ Settings</div><div class="ops-nav-item" data-view="settings">▢ Vault</div></div>
-      <div class="ops-user-card"><div class="ops-avatar">NP</div><div><b>Nelson Perez</b><small>Administrator</small></div><span>›</span></div>
-    </aside>
-    <main id="corex-main-scroll" data-view="inbox" class="ops-main">
-      <header class="ops-header"><div><h1>Operations Cockpit</h1><p>Your mission control for infrastructure operations</p></div><div class="ops-search">⌕ <span>Search tickets, templates, hosts, commands...</span><kbd>⌘K</kbd></div><div class="ops-integrations"><div>⚛ <b>Jira</b><small>Healthy</small></div><div>⬡ <b>AWX</b><small>Healthy</small></div><div class="locked">▣ <b>Vault</b><small>Locked</small></div><div>▱ <b>SSH</b><small>3 Active</small></div><div class="bell">♧<i></i></div><img class="photo" alt="User profile photo" src="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=80&q=80" /></div></header>
-      <section class="ops-kpis">
-        <article class="kpi red"><b>My Focus</b><small>High priority work</small><strong>3</strong><span>Needs attention</span></article>
-        <article class="kpi amber"><b>SLA At Risk</b><small>Next 60 minutes</small><strong>2</strong></article>
-        <article class="kpi green"><b>Automations</b><small>Success rate (7d)</small><strong>91%</strong>${renderSparkline('#22c55e')}</article>
-        <article class="kpi green"><b>System Health</b><small>Everything looks good</small><strong>Healthy</strong>${renderSparkline('#22c55e')}</article>
-        <article class="kpi purple"><b>Active Sessions</b><small>SSH connections</small><strong>3</strong></article>
-        <article class="add-widget">＋ Add Widget</article>
-      </section>
-      <section class="ops-grid">
-        <article class="panel work"><h2>My Work</h2><div class="tabs"><span class="on">All</span><span>At Risk <b>2</b></span><span>In Progress <b>3</b></span><span>Waiting <b>1</b></span><span>Resolved</span></div><table><thead><tr><th>Ticket</th><th>Priority</th><th>Summary</th><th>SLA</th><th>Service</th><th>Suggested Action</th><th></th></tr></thead><tbody>
-          ${[['ITSD-1234','P1','Payments API failing on prod','12m','Payments API','Restart Service','red'],['ITSD-1235','P2','Auth service intermittent errors','2h','Auth Service','Collect Logs','green'],['ITSD-1236','P2','High latency reported by users','3h','Web Frontend','Analyze Latency','green'],['ITSD-1237','P3','Slow DB queries detected','5h','Database','DB Health Check','yellow'],['ITSD-1238','P3','Disk space increasing','1d','File Storage','Extend Disk','yellow']].map(r=>`<tr class="${r[6]}"><td><b>${r[0]}</b></td><td><em>${r[1]}</em></td><td>${r[2]}</td><td class="sla">${r[3]}</td><td>${r[4]}</td><td><button>${r[5]}</button></td><td>›</td></tr>`).join('')}</tbody></table><footer>View all tickets →</footer></article>
-        <article class="panel detail"><div class="crumb">Jira / ITSD-1234 <button>Open in Jira</button> ⋮</div><h2>ITSD-1234 <em>P1</em> <span>Waiting for ops</span></h2><h3>Payments API failing on prod</h3><div class="meta"><span>Requester<br><b>▣ Maria Garcia</b></span><span>Service<br><b>Payments API</b></span><span>Created<br><b>2h ago</b></span><span>Updated<br><b>10m ago</b></span><span>SLA<br><b class="danger">12m remaining</b><i></i></span></div><div class="subtabs"><b>Overview</b><span>Comments 5</span><span>History</span><span>Linked 2</span><span>Attachments 3</span></div><div class="detail-cols"><div><h4>Description</h4><p>Payments API is responding with 500 errors intermittently on the production environment.<br><br>Impact: Users unable to complete payments.<br><br>Environment: Production (app-prod-01)</p><a>Show more</a><hr><h4>Fields</h4><dl><dt>Component</dt><dd>Payments API</dd><dt>Environment</dt><dd>Production</dd><dt>Priority</dt><dd>P1 - Critical</dd><dt>Labels</dt><dd>api, payments, prod</dd><dt>Assignee</dt><dd>Nelson Perez</dd></dl></div><div class="linked"><h4>Linked Automation <small>● Template linked</small></h4><div class="auto-card"><b>restart-service-linux</b><p><span>Linux</span><span>Service</span><span>Production</span></p><div><small>Success rate (30d)<b>92%</b></small><small>Last ran<b>2 days ago</b></small><small>Last status<b>Success</b></small></div><button>Run linked automation ⏵</button><button class="ghost">View template details</button></div><h4>Recent Evidence</h4><p>▧ Job #9281 output.txt <span>2 days ago ›</span></p><p>▧ service-status.png <span>2 days ago ›</span></p></div></div></article>
-        <aside class="ops-right"><article class="panel"><h3>Automation Suggestions <a>View all</a></h3>${['restart-service-linux|92%','collect-diagnostics|88%','analyze-latency|85%'].map(x=>{let [n,p]=x.split('|');return `<div class="suggest">▣ <b>${n}</b><small>Used 8 times for similar issues</small><strong>${p}</strong></div>`}).join('')}<footer>⌄ Why these suggestions? ⓘ</footer></article><article class="panel"><h3>Recent Jobs <a>View all</a></h3>${['#9281 restart-service-linux Success 2d','#9279 patch-linux Failed 35m','#9278 collect-diagnostics Success 1h','#9277 db-health-check Success 2h'].map(j=>`<p class="job">${j}</p>`).join('')}</article><article class="panel"><h3>System Health</h3><small class="ok">All systems operational</small>${['CPU 34','RAM 61','Disk 42','Network 23'].map(x=>{let [n,p]=x.split(' ');return `<div class="bar"><span>${n}</span><i><b style="width:${p}%"></b></i><em>${p}%</em></div>`}).join('')}</article></aside>
-      </section>
-      <section class="ops-bottom"><article class="terminal panel"><h3>CorexTerm <button>+ New</button></h3><div class="term-grid"><div class="sessions"><input placeholder="⌕ Search sessions..."/><b>⌄ Production</b><p class="active">⊙ app-prod-01</p><p>⊙ db-prod-01</p><p>⊙ lb-prod-01</p><b>› Staging</b><b>› Utilities</b></div><pre>Last login: May 16 09:42:11 2024 from 10.0.0.15\n\n[nelson@app-prod-01 ~]$ top\ntop - 09:42:11 up 15 days, 3:21, 2 users, load average: 0.15, 0.12, 0.10\nTasks: 178 total, 1 running, 177 sleeping, 0 stopped, 0 zombie\n%Cpu(s): 1.0 us, 0.4 sy, 0.0 ni, 98.0 id\nMiB Mem : 32064.1 total, 16334.6 free, 8924.8 used\n\n[nelson@app-prod-01 ~]$ █</pre></div></article><article class="code panel"><h3>VS Corex <span>README.md</span></h3><div class="code-grid"><div class="explorer">EXPLORER<br>⌄ my-automation<br>&nbsp;⌄ scripts<br>&nbsp;&nbsp;▣ restart-service.sh<br>&nbsp;&nbsp;▣ check-health.sh<br>&nbsp;▧ inventory.yml<br>&nbsp;▧ README.md</div><pre><b>restart-service.sh</b>\n\n<span># !/bin/bash</span>\n<span># Restart service script</span>\n\nSERVICE_NAME=$1\n\n<span class="pink">if [ -z "$SERVICE_NAME" ]; then</span>\n  echo "Usage: $0 &lt;service_name&gt;"\n  exit 1\nfi\n\nsudo systemctl restart $SERVICE_NAME\nsudo systemctl status $SERVICE_NAME --no-pager</pre></div></article></section>
-      <footer class="statusbar"><span>⚙ Workspace: operations</span><span>⑂ Branch: main</span><span>▣ Remote: app-prod-01</span><b>🔒 Vault: Locked</b><span>🦚 3 SSH Sessions</span></footer>
-    </main>`;
+function renderInboxWorkTable() {
+  const card = mk('div', { style: { background: C.surface1, border: `1px solid ${C.border}`, borderRadius: R.sm, overflow: 'hidden' } });
+  const header = mk('div', { style: { display: 'flex', alignItems: 'center', padding: S[4], borderBottom: `1px solid ${C.border}` } }, [
+    mk('div', { style: { fontSize: T.md, fontWeight: '700', color: C.textPrimary } }, ['My Work']),
+    mk('button', {
+      style: { marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border}`, color: C.textPrimary, borderRadius: R.sm, padding: '7px 10px', cursor: 'pointer' },
+      onclick: () => { state.view = 'jira'; renderApp(); if (state.inboxIssues.length === 0) loadInbox(); },
+    }, ['Open Jira queue →']),
+  ]);
+  card.appendChild(header);
 
-  wrap.querySelectorAll('[data-view]').forEach((item) => {
-    item.addEventListener('click', () => {
-      state.view = item.dataset.view;
-      renderApp();
-      if (state.view === 'awx' && state.awxTemplates.length === 0) loadAwxTemplates();
-      if (state.view === 'awx') loadAwxRecentJobs();
-      if (state.view === 'jira' && state.inboxIssues.length === 0) loadInbox();
-      if (state.view === 'corexterm' && state.ctSessions.length === 0) loadCtSessions();
-      if (state.view === 'vscorex') initVsCorex();
-    });
+  if (state.inboxError) {
+    card.appendChild(mk('div', { style: { padding: S[4], color: C.danger, fontSize: T.base } }, [state.inboxError]));
+    return card;
+  }
+  if (state.inboxLoading && state.inboxIssues.length === 0) {
+    card.appendChild(mk('div', { style: { padding: S[4], color: C.textSecondary, fontSize: T.base } }, ['Loading Jira issues…']));
+    return card;
+  }
+  if (state.inboxIssues.length === 0) {
+    card.appendChild(mk('div', { style: { padding: S[4], color: C.textSecondary, fontSize: T.base } }, [state.config.jira && state.config.jira.url ? 'No assigned Jira issues.' : 'Connect Jira in Settings to show assigned work.']));
+    return card;
+  }
+
+  const table = mk('div', { style: { display: 'grid', gridTemplateColumns: '105px 92px minmax(220px,1fr) 120px 150px', fontSize: T.sm } });
+  ['Ticket', 'Priority', 'Summary', 'Status', 'Linked automation'].forEach((h) => {
+    table.appendChild(mk('div', { style: { padding: `${S[2]} ${S[3]}`, color: C.textSecondary, borderBottom: `1px solid ${C.border}`, fontSize: T.xs, textTransform: 'uppercase', letterSpacing: '0.4px' } }, [h]));
   });
+
+  state.inboxIssues.slice(0, 8).forEach((issue) => {
+    const f = issue.fields || {};
+    const priorityColor = inboxPriorityColor(f.priority);
+    const link = state.ticketLinks[issue.key];
+    const rowCells = [
+      mk('button', { style: { color: C.textPrimary, background: 'transparent', border: '0', textAlign: 'left', cursor: 'pointer', fontWeight: '700' }, onclick: () => openJiraDetail(issue.key, 'inbox') }, [issue.key]),
+      mk('span', { style: { color: priorityColor, border: `1px solid ${priorityColor}`, borderRadius: R.pill, padding: '2px 8px', width: 'fit-content', fontWeight: '700' } }, [(f.priority && f.priority.name) || '—']),
+      mk('span', { style: { color: C.textPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, [f.summary || '(untitled)']),
+      mk('span', { style: { color: jiraStatusPillColor(f.status) } }, [(f.status && f.status.name) || '—']),
+      mk('span', { style: { color: link ? C.success : C.textSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, [link ? link.templateName : 'Not linked']),
+    ];
+    rowCells.forEach((cell) => table.appendChild(mk('div', { style: { padding: `${S[3]} ${S[3]}`, borderBottom: `1px solid ${C.surface2}`, minWidth: '0', display: 'flex', alignItems: 'center' } }, [cell])));
+  });
+  card.appendChild(table);
+  return card;
+}
+
+function renderInboxIntegrationsPanel() {
+  const card = mk('div', { style: { background: C.surface1, border: `1px solid ${C.border}`, borderRadius: R.sm, padding: S[4] } });
+  card.appendChild(mk('div', { style: { fontSize: T.md, fontWeight: '700', color: C.textPrimary, marginBottom: S[3] } }, ['Integrations']));
+  [
+    { name: 'Jira', ok: !!(state.config.jira && state.config.jira.url), detail: state.inboxError || `${state.inboxIssues.length} assigned issue(s)` },
+    { name: 'AWX', ok: !!(state.config.awx && state.config.awx.url), detail: `${state.awxTemplates.length} template(s)` },
+    { name: 'Vault', ok: state.vaultUnlocked, detail: state.vaultUnlocked ? 'Unlocked for this session' : 'Locked' },
+    { name: 'CorexTerm', ok: state.ctSessions.length > 0, detail: `${state.ctSessions.length} saved session(s)` },
+  ].forEach((item) => {
+    card.appendChild(mk('div', { style: { display: 'flex', alignItems: 'center', gap: S[2], padding: `${S[2]} 0`, borderBottom: `1px solid ${C.surface2}` } }, [
+      mk('span', { style: { width: '7px', height: '7px', borderRadius: '50%', background: item.ok ? C.success : C.warning, flexShrink: '0' } }),
+      mk('span', { style: { color: C.textPrimary, fontWeight: '700', minWidth: '78px' } }, [item.name]),
+      mk('span', { style: { color: item.ok ? C.success : C.warning, fontSize: T.sm, marginLeft: 'auto' } }, [item.ok ? 'Ready' : 'Needs setup']),
+      mk('span', { style: { color: C.textSecondary, fontSize: T.xs, width: '100%', flexBasis: '100%', marginLeft: '15px' } }, [item.detail]),
+    ]));
+  });
+  return card;
+}
+
+function renderInboxView() {
+  const wrap = mk('div', { style: { maxWidth: '1280px' } });
+
+  wrap.appendChild(mk('div', { style: { display: 'flex', alignItems: 'center', gap: S[4], marginBottom: S[5] } }, [
+    mk('div', {}, [
+      mk('h1', { style: { fontSize: T.lg, fontWeight: '700', marginBottom: S[1], color: C.textPrimary } }, ['Operations Cockpit']),
+      mk('p', { style: { fontSize: T.base, color: C.textSecondary } }, ['Live dashboard built from your real Jira, AWX, Vault, CorexTerm and local system data.']),
+    ]),
+    mk('button', { style: { marginLeft: 'auto', background: C.surface1, border: `1px solid ${C.border}`, color: C.textPrimary, borderRadius: R.sm, padding: '9px 12px', cursor: 'pointer' }, onclick: () => { state.view = 'settings'; renderApp(); } }, ['Configure integrations']),
+  ]));
+
+  const p1Count = state.inboxIssues.filter((issue) => priorityRank(issue.fields && issue.fields.priority) === 4).length;
+  const linkedCount = Object.keys(state.ticketLinks || {}).length;
+  const successfulJobs = state.awxRecentJobs.filter((job) => job.status === 'successful').length;
+  const successRate = state.awxRecentJobs.length ? `${Math.round((successfulJobs / state.awxRecentJobs.length) * 100)}%` : '—';
+  const cpuLoad = state.hwMetrics && state.hwMetrics.cpu ? `${state.hwMetrics.cpu.load.toFixed(0)}%` : '—';
+
+  const metrics = mk('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(5, minmax(150px, 1fr))', gap: S[3], marginBottom: S[5] } });
+  metrics.appendChild(renderDashboardMetricCard('My Work', state.inboxIssues.length, 'Assigned Jira issues', C.info, () => { state.view = 'jira'; renderApp(); }));
+  metrics.appendChild(renderDashboardMetricCard('P1 / Critical', p1Count, 'Highest-priority tickets', C.danger));
+  metrics.appendChild(renderDashboardMetricCard('Linked', linkedCount, 'Ticket → automation links', C.success));
+  metrics.appendChild(renderDashboardMetricCard('AWX Success', successRate, 'Recent job runs', C.warning, () => { state.view = 'awx'; renderApp(); loadAwxRecentJobs(); }));
+  metrics.appendChild(renderDashboardMetricCard('Local CPU', cpuLoad, 'Live hardware poll', C.success));
+  wrap.appendChild(metrics);
+
+  const grid = mk('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1.8fr) minmax(280px, 0.8fr)', gap: S[4], alignItems: 'start', marginBottom: S[5] } });
+  const left = mk('div', { style: { display: 'flex', flexDirection: 'column', gap: S[4] } });
+  left.appendChild(renderInboxWorkTable());
+  left.appendChild(renderHardwareSection());
+  left.appendChild(renderHwChartsSection());
+  const right = mk('div', { style: { display: 'flex', flexDirection: 'column', gap: S[4] } });
+  right.appendChild(renderInboxIntegrationsPanel());
+  right.appendChild(renderRecentJobsSection());
+  const topSection = renderTopTicketsSection();
+  if (topSection) right.appendChild(topSection);
+  grid.appendChild(left);
+  grid.appendChild(right);
+  wrap.appendChild(grid);
 
   return wrap;
 }
