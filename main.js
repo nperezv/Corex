@@ -1,12 +1,45 @@
 const { app, BrowserWindow, ipcMain, dialog, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const https = require('https');
 const http = require('http');
 const si = require('systeminformation');
 const crypto = require('crypto');
 const { Client: SSHClient } = require('ssh2');
 const simpleGit = require('simple-git');
+// Windows + OneDrive/corporate profiles can leave Electron's default GPU/cache
+// directory unwritable, which shows as Chromium cache errors followed by a
+// black window. Put Chromium session/cache data in an explicit local writable
+// directory before Chromium starts, without touching COREX's encrypted vault.
+function configureChromiumCachePaths() {
+  const base = process.platform === 'win32'
+    ? (process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'))
+    : app.getPath('userData');
+  const sessionDataPath = path.join(base, 'COREX', 'ElectronSession');
+  const diskCachePath = path.join(sessionDataPath, 'Cache');
+
+  try {
+    fs.mkdirSync(diskCachePath, { recursive: true });
+    app.setPath('sessionData', sessionDataPath);
+    app.commandLine.appendSwitch('disk-cache-dir', diskCachePath);
+    app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+  } catch (e) {
+    const fallbackSession = path.join(os.tmpdir(), 'corex-electron-session');
+    const fallbackCache = path.join(fallbackSession, 'Cache');
+    try {
+      fs.mkdirSync(fallbackCache, { recursive: true });
+      app.setPath('sessionData', fallbackSession);
+      app.commandLine.appendSwitch('disk-cache-dir', fallbackCache);
+      app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+      console.warn('[COREX] Using temporary Electron cache directory:', fallbackSession, e.message);
+    } catch (fallbackErr) {
+      console.warn('[COREX] Could not configure Electron cache directory:', fallbackErr.message);
+    }
+  }
+}
+configureChromiumCachePaths();
+
 let pty;
 try {
   pty = require('node-pty');
@@ -199,6 +232,16 @@ function createWindow() {
     if (details.reason !== 'clean-exit') {
       win.webContents.reload();
     }
+  });
+
+  // Si el renderer falla durante el rediseño visual, una ventana negra sin
+  // DevTools no dice nada. Reenviamos errores de consola al proceso main para
+  // que npm start muestre la causa real junto a los logs de Electron.
+  win.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    if (level >= 2) console.error(`[COREX renderer] ${sourceId}:${line} ${message}`);
+  });
+  win.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    console.error('[COREX] Failed to load renderer:', errorCode, errorDescription, validatedURL);
   });
 
   win.loadFile(path.join(__dirname, 'src/index.html'));
