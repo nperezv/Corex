@@ -680,6 +680,25 @@ function renderApp() {
 
   app.innerHTML = '';
 
+  if (state.view === 'inbox') {
+    const cockpit = renderOperationsCockpit();
+    app.appendChild(cockpit);
+
+    const t = renderToast();
+    if (t) app.appendChild(t);
+
+    const connectivityBanner = renderConnectivityBanner();
+    if (connectivityBanner) app.appendChild(connectivityBanner);
+
+    const banners = renderPersistentBanners();
+    if (banners) app.appendChild(banners);
+
+    if (state.showPendingAttachmentsModal) {
+      app.appendChild(renderPendingAttachmentsModal());
+    }
+    return;
+  }
+
   const layout = mk('div', { style: { display: 'flex', height: '100%' } });
   layout.appendChild(renderSidebar());
 
@@ -2935,28 +2954,59 @@ function renderTopTicketsSection() {
   return wrap;
 }
 
-function renderInboxView() {
-  const wrap = mk('div', { style: { maxWidth: '980px' } });
+function renderSparkline(color = '#22c55e') {
+  return `<svg viewBox="0 0 120 28" class="spark" aria-hidden="true"><polyline points="2,20 14,18 26,21 36,12 48,16 58,9 70,14 82,7 94,10 106,3 118,5" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
 
-  wrap.appendChild(mk('h1', { style: { fontSize: '22px', fontWeight: '700', marginBottom: '4px', color: '#dfe3e7' } }, [t('inbox_title')]));
-  wrap.appendChild(mk('p', { style: { fontSize: '13px', color: '#5e6670', marginBottom: '20px' } }, [t('inbox_subtitle')]));
+function renderOperationsCockpit() {
+  const wrap = mk('div', { class: 'ops-cockpit-shell' });
+  wrap.innerHTML = `
+    <aside class="ops-sidebar">
+      <div class="ops-brand"><span class="ops-logo-mark">◆◆</span><strong>COREX</strong></div>
+      <div class="ops-nav-group active"><div class="ops-nav-title">⬢ Operate <span>⌃</span></div><div class="ops-nav-item selected" data-view="inbox">☄ Cockpit</div><div class="ops-nav-item" data-view="jira">♮ My Work</div></div>
+      <div class="ops-nav-group"><div class="ops-nav-title">⬡ Automate <span>⌃</span></div><div class="ops-nav-item" data-view="awx">◇ AWX Templates</div><div class="ops-nav-item" data-view="awx">▣ Jobs</div></div>
+      <div class="ops-nav-group"><div class="ops-nav-title">♧ Connect <span>⌃</span></div><div class="ops-nav-item" data-view="corexterm">▤ CorexTerm</div><div class="ops-nav-item" data-view="corexterm">⌘ Sessions</div></div>
+      <div class="ops-nav-group"><div class="ops-nav-title">▣ Build <span>⌃</span></div><div class="ops-nav-item" data-view="vscorex">♨ VS Corex</div><div class="ops-nav-item" data-view="vscorex">⌘ Workspaces</div></div>
+      <div class="ops-nav-group"><div class="ops-nav-title">⚙ Configure <span>⌃</span></div><div class="ops-nav-item" data-view="settings">⚙ Settings</div><div class="ops-nav-item" data-view="settings">▢ Vault</div></div>
+      <div class="ops-user-card"><div class="ops-avatar">NP</div><div><b>Nelson Perez</b><small>Administrator</small></div><span>›</span></div>
+    </aside>
+    <main id="corex-main-scroll" data-view="inbox" class="ops-main">
+      <header class="ops-header"><div><h1>Operations Cockpit</h1><p>Your mission control for infrastructure operations</p></div><div class="ops-search">⌕ <span>Search tickets, templates, hosts, commands...</span><kbd>⌘K</kbd></div><div class="ops-integrations"><div>⚛ <b>Jira</b><small>Healthy</small></div><div>⬡ <b>AWX</b><small>Healthy</small></div><div class="locked">▣ <b>Vault</b><small>Locked</small></div><div>▱ <b>SSH</b><small>3 Active</small></div><div class="bell">♧<i></i></div><img class="photo" alt="User profile photo" src="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=80&q=80" /></div></header>
+      <section class="ops-kpis">
+        <article class="kpi red"><b>My Focus</b><small>High priority work</small><strong>3</strong><span>Needs attention</span></article>
+        <article class="kpi amber"><b>SLA At Risk</b><small>Next 60 minutes</small><strong>2</strong></article>
+        <article class="kpi green"><b>Automations</b><small>Success rate (7d)</small><strong>91%</strong>${renderSparkline('#22c55e')}</article>
+        <article class="kpi green"><b>System Health</b><small>Everything looks good</small><strong>Healthy</strong>${renderSparkline('#22c55e')}</article>
+        <article class="kpi purple"><b>Active Sessions</b><small>SSH connections</small><strong>3</strong></article>
+        <article class="add-widget">＋ Add Widget</article>
+      </section>
+      <section class="ops-grid">
+        <article class="panel work"><h2>My Work</h2><div class="tabs"><span class="on">All</span><span>At Risk <b>2</b></span><span>In Progress <b>3</b></span><span>Waiting <b>1</b></span><span>Resolved</span></div><table><thead><tr><th>Ticket</th><th>Priority</th><th>Summary</th><th>SLA</th><th>Service</th><th>Suggested Action</th><th></th></tr></thead><tbody>
+          ${[['ITSD-1234','P1','Payments API failing on prod','12m','Payments API','Restart Service','red'],['ITSD-1235','P2','Auth service intermittent errors','2h','Auth Service','Collect Logs','green'],['ITSD-1236','P2','High latency reported by users','3h','Web Frontend','Analyze Latency','green'],['ITSD-1237','P3','Slow DB queries detected','5h','Database','DB Health Check','yellow'],['ITSD-1238','P3','Disk space increasing','1d','File Storage','Extend Disk','yellow']].map(r=>`<tr class="${r[6]}"><td><b>${r[0]}</b></td><td><em>${r[1]}</em></td><td>${r[2]}</td><td class="sla">${r[3]}</td><td>${r[4]}</td><td><button>${r[5]}</button></td><td>›</td></tr>`).join('')}</tbody></table><footer>View all tickets →</footer></article>
+        <article class="panel detail"><div class="crumb">Jira / ITSD-1234 <button>Open in Jira</button> ⋮</div><h2>ITSD-1234 <em>P1</em> <span>Waiting for ops</span></h2><h3>Payments API failing on prod</h3><div class="meta"><span>Requester<br><b>▣ Maria Garcia</b></span><span>Service<br><b>Payments API</b></span><span>Created<br><b>2h ago</b></span><span>Updated<br><b>10m ago</b></span><span>SLA<br><b class="danger">12m remaining</b><i></i></span></div><div class="subtabs"><b>Overview</b><span>Comments 5</span><span>History</span><span>Linked 2</span><span>Attachments 3</span></div><div class="detail-cols"><div><h4>Description</h4><p>Payments API is responding with 500 errors intermittently on the production environment.<br><br>Impact: Users unable to complete payments.<br><br>Environment: Production (app-prod-01)</p><a>Show more</a><hr><h4>Fields</h4><dl><dt>Component</dt><dd>Payments API</dd><dt>Environment</dt><dd>Production</dd><dt>Priority</dt><dd>P1 - Critical</dd><dt>Labels</dt><dd>api, payments, prod</dd><dt>Assignee</dt><dd>Nelson Perez</dd></dl></div><div class="linked"><h4>Linked Automation <small>● Template linked</small></h4><div class="auto-card"><b>restart-service-linux</b><p><span>Linux</span><span>Service</span><span>Production</span></p><div><small>Success rate (30d)<b>92%</b></small><small>Last ran<b>2 days ago</b></small><small>Last status<b>Success</b></small></div><button>Run linked automation ⏵</button><button class="ghost">View template details</button></div><h4>Recent Evidence</h4><p>▧ Job #9281 output.txt <span>2 days ago ›</span></p><p>▧ service-status.png <span>2 days ago ›</span></p></div></div></article>
+        <aside class="ops-right"><article class="panel"><h3>Automation Suggestions <a>View all</a></h3>${['restart-service-linux|92%','collect-diagnostics|88%','analyze-latency|85%'].map(x=>{let [n,p]=x.split('|');return `<div class="suggest">▣ <b>${n}</b><small>Used 8 times for similar issues</small><strong>${p}</strong></div>`}).join('')}<footer>⌄ Why these suggestions? ⓘ</footer></article><article class="panel"><h3>Recent Jobs <a>View all</a></h3>${['#9281 restart-service-linux Success 2d','#9279 patch-linux Failed 35m','#9278 collect-diagnostics Success 1h','#9277 db-health-check Success 2h'].map(j=>`<p class="job">${j}</p>`).join('')}</article><article class="panel"><h3>System Health</h3><small class="ok">All systems operational</small>${['CPU 34','RAM 61','Disk 42','Network 23'].map(x=>{let [n,p]=x.split(' ');return `<div class="bar"><span>${n}</span><i><b style="width:${p}%"></b></i><em>${p}%</em></div>`}).join('')}</article></aside>
+      </section>
+      <section class="ops-bottom"><article class="terminal panel"><h3>CorexTerm <button>+ New</button></h3><div class="term-grid"><div class="sessions"><input placeholder="⌕ Search sessions..."/><b>⌄ Production</b><p class="active">⊙ app-prod-01</p><p>⊙ db-prod-01</p><p>⊙ lb-prod-01</p><b>› Staging</b><b>› Utilities</b></div><pre>Last login: May 16 09:42:11 2024 from 10.0.0.15\n\n[nelson@app-prod-01 ~]$ top\ntop - 09:42:11 up 15 days, 3:21, 2 users, load average: 0.15, 0.12, 0.10\nTasks: 178 total, 1 running, 177 sleeping, 0 stopped, 0 zombie\n%Cpu(s): 1.0 us, 0.4 sy, 0.0 ni, 98.0 id\nMiB Mem : 32064.1 total, 16334.6 free, 8924.8 used\n\n[nelson@app-prod-01 ~]$ █</pre></div></article><article class="code panel"><h3>VS Corex <span>README.md</span></h3><div class="code-grid"><div class="explorer">EXPLORER<br>⌄ my-automation<br>&nbsp;⌄ scripts<br>&nbsp;&nbsp;▣ restart-service.sh<br>&nbsp;&nbsp;▣ check-health.sh<br>&nbsp;▧ inventory.yml<br>&nbsp;▧ README.md</div><pre><b>restart-service.sh</b>\n\n<span># !/bin/bash</span>\n<span># Restart service script</span>\n\nSERVICE_NAME=$1\n\n<span class="pink">if [ -z "$SERVICE_NAME" ]; then</span>\n  echo "Usage: $0 &lt;service_name&gt;"\n  exit 1\nfi\n\nsudo systemctl restart $SERVICE_NAME\nsudo systemctl status $SERVICE_NAME --no-pager</pre></div></article></section>
+      <footer class="statusbar"><span>⚙ Workspace: operations</span><span>⑂ Branch: main</span><span>▣ Remote: app-prod-01</span><b>🔒 Vault: Locked</b><span>🦚 3 SSH Sessions</span></footer>
+    </main>`;
 
-  // Las métricas de hardware no dependen de Jira/AWX, así que se muestran siempre.
-  wrap.appendChild(renderHardwareSection());
-
-  // Gráficas en tiempo real de CPU/Memoria, con ventana de tiempo elegible
-  // por el usuario (60s/5m/1h) — usan el mismo historial que se acumula
-  // en cada tick del polling, no dependen de Jira/AWX tampoco.
-  wrap.appendChild(renderHwChartsSection());
-
-  // El Dashboard es solo panorama — sin botones de acción. La lista completa
-  // de tickets, con vincular/ejecutar AWX, vive en la vista Jira.
-  if (state.config.jira && state.config.jira.url) {
-    const topSection = renderTopTicketsSection();
-    if (topSection) wrap.appendChild(topSection);
-  }
+  wrap.querySelectorAll('[data-view]').forEach((item) => {
+    item.addEventListener('click', () => {
+      state.view = item.dataset.view;
+      renderApp();
+      if (state.view === 'awx' && state.awxTemplates.length === 0) loadAwxTemplates();
+      if (state.view === 'awx') loadAwxRecentJobs();
+      if (state.view === 'jira' && state.inboxIssues.length === 0) loadInbox();
+      if (state.view === 'corexterm' && state.ctSessions.length === 0) loadCtSessions();
+      if (state.view === 'vscorex') initVsCorex();
+    });
+  });
 
   return wrap;
+}
+
+function renderInboxView() {
+  return renderOperationsCockpit();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
