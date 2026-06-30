@@ -3148,6 +3148,10 @@ function renderInboxView() {
   return wrap;
 }
 
+function renderInboxView() {
+  return renderOperationsCockpit();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Jira — vista de detalle de ticket: info completa + comentar + adjuntar
 // ═══════════════════════════════════════════════════════════════════════════
