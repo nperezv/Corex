@@ -34,7 +34,10 @@ let vaultKeyCache = null; // Buffer de 32 bytes derivado de la Master Password, 
 let vaultDataCache = null; // contenido descifrado del vault, solo en memoria mientras está unlocked
 
 function defaultVaultData() {
-  return { jira: {}, awx: {}, smtp: {}, lang: 'en', ticketLinks: {}, favoriteTemplates: [], templateUsage: {}, ctSessions: [], ctMacros: [] };
+  return {
+    jira: {}, awx: {}, smtp: {}, lang: 'en', ticketLinks: {}, favoriteTemplates: [], templateUsage: {},
+    ctSessions: [], ctMacros: [], automationTemplates: [], pendingAttachments: [],
+  };
 }
 
 function vaultExists() {
@@ -63,10 +66,34 @@ function decryptBlob(payload, key) {
 }
 
 function persistVault() {
-  if (!vaultKeyCache || !vaultDataCache) return;
-  const salt = Buffer.from(vaultSaltHex, 'hex');
+  if (!vaultKeyCache || !vaultDataCache) return { ok: false, error: 'Vault is locked' };
   const encrypted = encryptBlob(vaultDataCache, vaultKeyCache);
-  fs.writeFileSync(VAULT_PATH, JSON.stringify({ salt: vaultSaltHex, ...encrypted }, null, 2), 'utf-8');
+  const payload = JSON.stringify({ salt: vaultSaltHex, ...encrypted }, null, 2);
+
+  // Escritura atómica: si esto se interrumpiera a mitad (cierre de la app,
+  // corte de luz, etc.) con un writeFileSync directo sobre VAULT_PATH, el
+  // archivo final podría quedar truncado y CORROMPER TODO el vault — no
+  // solo el cambio en curso, sino todas las credenciales y sesiones SSH ya
+  // guardadas. En su lugar: escribimos a un archivo temporal en el MISMO
+  // directorio (el rename solo es atómico dentro del mismo filesystem) y
+  // solo al final hacemos el rename — esa operación sí es atómica a nivel
+  // de sistema operativo, así que el archivo final nunca queda en un
+  // estado intermedio corrupto, pase lo que pase durante la escritura.
+  const tmpPath = `${VAULT_PATH}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmpPath, payload, 'utf-8');
+    fs.renameSync(tmpPath, VAULT_PATH);
+    return { ok: true };
+  } catch (e) {
+    // Si algo falló a mitad, intentamos limpiar el temporal para no dejar
+    // basura — pero NUNCA tocamos VAULT_PATH directamente en el error,
+    // así que el vault anterior (el último bueno) sigue intacto en disco.
+    try { fs.unlinkSync(tmpPath); } catch (cleanupErr) { /* el temporal puede no haberse llegado a crear */ }
+    // Devolvemos el fallo en vez de lanzar: saveConfig() la llaman 13
+    // handlers que hoy no tienen try/catch propio — un throw aquí se
+    // propagaría como excepción no capturada en vez de un error legible.
+    return { ok: false, error: e.message };
+  }
 }
 
 let vaultSaltHex = null;
@@ -138,9 +165,9 @@ function loadConfig() {
 }
 
 function saveConfig(cfg) {
-  if (!isVaultUnlocked()) return;
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
   vaultDataCache = { ...vaultDataCache, ...cfg };
-  persistVault();
+  return persistVault();
 }
 
 function createWindow() {
@@ -160,8 +187,37 @@ function createWindow() {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
   });
 
+  // Si el renderer crashea (OOM, fallo de Chromium, etc.) sin esto la
+  // ventana se queda en blanco para siempre, sin ningún indicio de qué
+  // pasó — el usuario vería COREX "congelado" sin entender por qué.
+  // 'crashed'/'renderer-process-crashed' están eliminados en Electron
+  // reciente; 'render-process-gone' es el reemplazo oficial. Intentamos
+  // una recarga automática (el vault tiene que volver a desbloquearse,
+  // pero al menos la app vuelve a responder en vez de quedar muerta).
+  win.webContents.on('render-process-gone', (event, details) => {
+    console.error('[COREX] Renderer process gone:', details.reason, details);
+    if (details.reason !== 'clean-exit') {
+      win.webContents.reload();
+    }
+  });
+
   win.loadFile(path.join(__dirname, 'src/index.html'));
 }
+
+// Red de seguridad para el proceso main: si algo lanza una excepción que
+// nadie capturó (un bug real en cualquiera de los ~80 handlers de IPC), por
+// defecto Node mataría el proceso entero sin avisar — toda la app se
+// cerraría de golpe, sin guardar nada, sin ningún mensaje. En vez de eso,
+// lo logueamos para poder diagnosticarlo después. No reintentamos nada
+// automáticamente aquí porque no sabemos en qué estado quedó la operación
+// que falló — mejor un log claro que un intento de "seguir como si nada"
+// que podría enmascarar corrupción de datos.
+process.on('uncaughtException', (err) => {
+  console.error('[COREX] Uncaught exception in main process:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[COREX] Unhandled rejection in main process:', reason);
+});
 
 app.whenReady().then(createWindow);
 
@@ -169,8 +225,25 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
+// Sin esto, al cerrar COREX las conexiones SSH se cortaban de forma
+// abrupta (el socket simplemente se destruye junto al proceso) en vez de
+// con un cierre limpio del protocolo — algunos servidores tardan en
+// liberar esas sesiones colgadas hasta que expiran por timeout del lado
+// del servidor. Y los procesos node-pty de los terminales locales podían
+// quedar huérfanos en el sistema operativo, sin que nada los matara.
+// 'before-quit' se dispara ANTES de que el proceso empiece a terminar —
+// el momento correcto para hacer limpieza con la garantía de que todo
+// (incluyendo Node, las conexiones de red) sigue completamente vivo.
+app.on('before-quit', () => {
+  console.log(`[COREX] Closing ${activeTerminals.size} terminal(s) and ${activeSftp.size} SFTP connection(s) before quit`);
+  activeTerminals.forEach((entry) => closeTerminalEntry(entry));
+  activeTerminals.clear();
+  activeSftp.forEach((entry) => closeSftpEntry(entry));
+  activeSftp.clear();
+});
+
 // ── Generic HTTP request helper (no external deps, works for Jira + AWX) ───
-function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUnauthorized = true, _redirectCount = 0 }) {
+function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUnauthorized = true, timeoutMs = 20000, _redirectCount = 0 }) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -210,7 +283,7 @@ function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUna
           resolve({ status: res.statusCode, headers: res.headers, body: null });
           return;
         }
-        httpRequest({ url: nextUrl.toString(), method, headers, body, rejectUnauthorized, _redirectCount: _redirectCount + 1 })
+        httpRequest({ url: nextUrl.toString(), method, headers, body, rejectUnauthorized, timeoutMs, _redirectCount: _redirectCount + 1 })
           .then(resolve, reject);
         return;
       }
@@ -223,10 +296,96 @@ function httpRequest({ url, method = 'GET', headers = {}, body = null, rejectUna
       });
     });
 
+    // Sin esto, una conexión que se cuelga sin error explícito (VPN caída a
+    // mitad, firewall que descarta paquetes en silencio, servidor saturado
+    // que nunca responde) nunca terminaba — la promesa quedaba pendiente
+    // para siempre. Con el polling de listas cada 15s ya activo, eso podía
+    // acumular conexiones colgadas sin límite. setTimeout en el socket HTTP
+    // dispara el evento 'timeout', desde el cual destruimos la request
+    // manualmente (eso es lo que realmente hace que 'error' se dispare con
+    // un mensaje claro, en vez de quedarse colgada).
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+
     req.on('error', (err) => reject(err));
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+// Envoltorio de httpRequest con reintentos automáticos — SOLO para
+// operaciones de LECTURA idempotentes (listar, buscar, leer estado).
+// Nunca para escrituras (lanzar un job, comentar, transicionar, subir un
+// adjunto): si la respuesta de "lanzar job" se pierde por un timeout justo
+// después de que el servidor ya lo procesó, reintentar a ciegas podría
+// ejecutar el mismo job dos veces — y muchos templates de AWX hacen cosas
+// como borrar snapshots o modificar VMs, donde duplicar la ejecución no es
+// solo molesto, es potencialmente dañino. Por eso esto es una función
+// APARTE que cada handler debe llamar a propósito, nunca el comportamiento
+// por defecto de httpRequest.
+//
+// Solo reintenta ante: errores de red reales (timeout, conexión rechazada)
+// o códigos 502/503/504 (problema transitorio del servidor). NUNCA ante
+// 401/403/404/cualquier 4xx — esos no se arreglan reintentando, son
+// errores del propio request, no del transporte.
+async function httpRequestWithRetry(opts, maxRetries = 2) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await httpRequest(opts);
+      if ([502, 503, 504].includes(res.status) && attempt < maxRetries) {
+        await sleepWithJitter(attempt);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastError = e;
+      if (isNetworkErrorException(e) && attempt < maxRetries) {
+        await sleepWithJitter(attempt);
+        continue;
+      }
+      throw e; // error no reintentable, o ya se acabaron los intentos
+    }
+  }
+  throw lastError;
+}
+
+// Backoff exponencial con jitter: 500ms/1000ms/2000ms ± hasta 30% aleatorio
+// — el jitter evita que, si varias peticiones fallan a la vez (por ejemplo
+// las 3 del polling simultáneo), todas reintenten en el mismo instante
+// exacto y vuelvan a golpear al servidor de golpe otra vez.
+function sleepWithJitter(attempt) {
+  const base = 500 * Math.pow(2, attempt);
+  const jitter = base * 0.3 * Math.random();
+  return new Promise((resolve) => setTimeout(resolve, base + jitter));
+}
+
+// Único punto que genera la respuesta de error para 401/403 — antes cada
+// handler construía su propio string de error a mano, y el frontend no
+// tenía forma fiable de distinguir "credenciales caducadas, hay que volver
+// a Settings" de "fallo de red transitorio" sin parsear el texto del
+// mensaje (frágil: si el texto cambia en un sitio y no en otro, se rompe
+// la detección). isAuthError es un campo explícito que el frontend puede
+// comprobar directamente, sin adivinar nada a partir de un string.
+function authErrorResponse(status) {
+  return { ok: false, error: `Authentication failed (HTTP ${status}) — check your credentials in Settings`, isAuthError: true };
+}
+
+// Mismo concepto que authErrorResponse, pero para fallos de CONEXIÓN real
+// (timeout, DNS que no resuelve, conexión rechazada) — distinto de un error
+// HTTP normal (el servidor sí respondió, solo que con un código de error).
+// Sin esto, el frontend no podía distinguir "no hay red/VPN caída" de
+// "Jira devolvió un 500" a partir del e.message crudo, que varía según el
+// tipo exacto de fallo de Node (ECONNREFUSED, ETIMEDOUT, ENOTFOUND...).
+const NETWORK_ERROR_CODES = ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH'];
+function isNetworkErrorException(e) {
+  if (e && NETWORK_ERROR_CODES.includes(e.code)) return true;
+  if (e && typeof e.message === 'string' && e.message.includes('timed out')) return true; // nuestro propio mensaje de req.setTimeout
+  return false;
+}
+function networkErrorResponse(e) {
+  return { ok: false, error: e.message, isNetworkError: true };
 }
 
 // ── Config ───────────────────────────────────────────────────────────────
@@ -307,18 +466,16 @@ ipcMain.handle('awx:listJobTemplates', async () => {
   const { awx } = loadConfig();
   if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
   try {
-    const res = await httpRequest({
+    const res = await httpRequestWithRetry({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/job_templates/?page_size=200`,
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `Permisos insuficientes (HTTP ${res.status})` };
-    }
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
   } catch (e) {
-    return { ok: false, error: e.message };
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
   }
 });
 
@@ -426,9 +583,7 @@ ipcMain.handle('awx:launchJob', async (event, { templateId, extraVars, launchOpt
       body,
       rejectUnauthorized: awx.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `Sin permiso de ejecución sobre este template (HTTP ${res.status})` };
-    }
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) {
       return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     }
@@ -448,7 +603,7 @@ ipcMain.handle('awx:getJob', async (event, { jobId }) => {
   const { awx } = loadConfig();
   if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
   try {
-    const res = await httpRequest({
+    const res = await httpRequestWithRetry({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/jobs/${jobId}/`,
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
@@ -465,7 +620,7 @@ ipcMain.handle('awx:getJobStdout', async (event, { jobId }) => {
   const { awx } = loadConfig();
   if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
   try {
-    const res = await httpRequest({
+    const res = await httpRequestWithRetry({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/jobs/${jobId}/stdout/?format=txt`,
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
@@ -508,15 +663,16 @@ ipcMain.handle('awx:getRecentJobs', async (event, { limit }) => {
   if (!awxConfigured(awx)) return { ok: false, error: 'AWX no configurado' };
   try {
     const pageSize = limit || 8;
-    const res = await httpRequest({
+    const res = await httpRequestWithRetry({
       url: `${awx.url.replace(/\/$/, '')}/api/v2/jobs/?order_by=-created&page_size=${pageSize}`,
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, jobs: (res.body && res.body.results) || [] };
   } catch (e) {
-    return { ok: false, error: e.message };
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
   }
 });
 
@@ -535,12 +691,40 @@ ipcMain.handle('jira:getIssue', async (event, { key }) => {
   if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
   try {
     const res = await httpRequest({
-      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}`,
+      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}?expand=names&properties=*all`,
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: sin permisos de lectura` };
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
+
+    // El campo comment.comments embebido en el issue NUNCA trae las
+    // propiedades de cada comentario (confirmado con datos reales: 22
+    // comentarios de un ticket real, ninguno con properties, incluso con
+    // ?properties=*all activo) — properties=*all aplica a propiedades del
+    // ISSUE, no se propaga a comentarios anidados. El parámetro correcto
+    // para esto es expand=properties, pero solo existe en el endpoint
+    // DEDICADO de comentarios (GET /issue/{key}/comment), no en el
+    // embebido. Por eso hacemos una segunda llamada y fusionamos el
+    // resultado — sin esto, nunca podríamos saber qué comentarios son
+    // internos vs públicos.
+    if (res.body && res.body.fields && res.body.fields.comment) {
+      try {
+        const commentsRes = await httpRequest({
+          url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/comment?expand=properties`,
+          headers: jiraAuthHeader(jira),
+          rejectUnauthorized: jira.verifySsl !== false,
+        });
+        if (commentsRes.status < 400 && commentsRes.body && commentsRes.body.comments) {
+          res.body.fields.comment.comments = commentsRes.body.comments;
+        }
+      } catch (e) {
+        // Si esta segunda llamada falla, seguimos con los comentarios sin
+        // properties (el comportamiento de antes) en vez de tumbar toda
+        // la carga del ticket por un fallo en un enriquecimiento opcional.
+      }
+    }
+
     return { ok: true, issue: res.body };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -555,32 +739,43 @@ ipcMain.handle('jira:searchMyIssues', async () => {
   try {
     const jql = encodeURIComponent('assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC');
     const fields = encodeURIComponent('summary,status,priority,updated,issuetype,components,parent');
-    const res = await httpRequest({
+    const res = await httpRequestWithRetry({
       url: `${jira.url.replace(/\/$/, '')}/rest/api/2/search?jql=${jql}&fields=${fields}&maxResults=100`,
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
-    if (res.status === 401 || res.status === 403) return { ok: false, error: `HTTP ${res.status}: sin permisos de lectura` };
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     return { ok: true, issues: (res.body && res.body.issues) || [] };
   } catch (e) {
-    return { ok: false, error: e.message };
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
   }
 });
 
-ipcMain.handle('jira:addComment', async (event, { key, body }) => {
+ipcMain.handle('jira:addComment', async (event, { key, body, internal }) => {
   const { jira } = loadConfig();
   if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
   try {
+    // En proyectos Jira Service Desk/Service Management, un comentario
+    // "interno" (invisible para el solicitante en el portal) no usa el
+    // mecanismo genérico de visibility por rol — eso solo restringe por
+    // rol/grupo dentro de Jira, pero el cliente seguiría sin verlo de
+    // todas formas porque los clientes de portal no tienen rol Jira. El
+    // mecanismo correcto es la propiedad sd.public.comment con
+    // internal:true, documentada para Service Desk Server/DC.
+    const payload = { body };
+    if (internal) {
+      payload.properties = [{ key: 'sd.public.comment', value: { internal: true } }];
+    }
     const res = await httpRequest({
       url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/comment`,
       method: 'POST',
       headers: jiraAuthHeader(jira),
-      body: { body },
+      body: payload,
       rejectUnauthorized: jira.verifySsl !== false,
     });
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `HTTP ${res.status}: sin permiso para comentar (ver rol Service Desk Agent)` };
+      return { ok: false, error: `HTTP ${res.status}: sin permiso para comentar (ver rol Service Desk Agent)`, isAuthError: true };
     }
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     return { ok: true, comment: res.body };
@@ -701,6 +896,26 @@ ipcMain.handle('jira:downloadAttachment', async (event, { url, suggestedName }) 
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     fs.writeFileSync(filePath, res.buffer);
     return { ok: true, filePath };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Descarga el thumbnail de un adjunto (URL propia que Jira ya expone aparte
+// de la imagen completa) y lo devuelve como base64 — para pintarlo inline
+// en el detalle del ticket, sin pasar por un diálogo de guardado como hace
+// la descarga completa.
+ipcMain.handle('jira:fetchThumbnail', async (event, { url, mimeType }) => {
+  const { jira } = loadConfig();
+  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  try {
+    const res = await httpDownloadBinary({
+      url,
+      headers: jiraAuthHeader(jira),
+      rejectUnauthorized: jira.verifySsl !== false,
+    });
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
+    return { ok: true, dataUrl: `data:${mimeType || 'image/png'};base64,${res.buffer.toString('base64')}` };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -910,7 +1125,8 @@ ipcMain.handle('corexterm:saveSession', async (event, { session }) => {
   const idx = cfg.ctSessions.findIndex((s) => s.id === id);
   if (idx >= 0) cfg.ctSessions[idx] = stored;
   else cfg.ctSessions.push(stored);
-  saveConfig(cfg);
+  const saveRes = saveConfig(cfg);
+  if (!saveRes.ok) return { ok: false, error: `Could not save to disk: ${saveRes.error}` };
   return { ok: true, id };
 });
 
@@ -1113,13 +1329,21 @@ ipcMain.handle('corexterm:resize', async (event, { terminalId, cols, rows }) => 
   return { ok: true };
 });
 
+// Cierre limpio de un terminal individual — extraído como función propia
+// para poder reutilizarla tanto en la desconexión manual de una pestaña
+// (el flujo de siempre) como en la limpieza global al cerrar toda la app.
+function closeTerminalEntry(entry) {
+  if (!entry) return;
+  if (entry.kind === 'local' && entry.ptyProcess) entry.ptyProcess.kill();
+  if (entry.stream) entry.stream.end();
+  if (entry.sshConn) entry.sshConn.end();
+  if (entry.jumpConn) entry.jumpConn.end();
+}
+
 ipcMain.handle('corexterm:disconnect', async (event, { terminalId }) => {
   const entry = activeTerminals.get(terminalId);
   if (entry) {
-    if (entry.kind === 'local' && entry.ptyProcess) entry.ptyProcess.kill();
-    if (entry.stream) entry.stream.end();
-    if (entry.sshConn) entry.sshConn.end();
-    if (entry.jumpConn) entry.jumpConn.end();
+    closeTerminalEntry(entry);
     activeTerminals.delete(terminalId);
   }
   return { ok: true };
@@ -1248,10 +1472,15 @@ ipcMain.handle('corexterm:sftpDelete', async (event, { sessionId, remotePath, is
   });
 });
 
+function closeSftpEntry(entry) {
+  if (!entry) return;
+  if (entry.sshConn) entry.sshConn.end();
+}
+
 ipcMain.handle('corexterm:sftpDisconnect', async (event, { sessionId }) => {
   const entry = activeSftp.get(sessionId);
   if (entry) {
-    entry.sshConn.end();
+    closeSftpEntry(entry);
     activeSftp.delete(sessionId);
   }
   return { ok: true };
@@ -1473,4 +1702,179 @@ ipcMain.handle('vscorex:gitPull', async (event, { dirPath }) => {
     if (isGitNotFoundError(e)) return { ok: false, error: 'git-not-found' };
     return { ok: false, error: e.message };
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Ticket Automation Templates — transiciones de Jira, plantillas, cola de
+//  adjuntos pendientes
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Las transiciones de Jira no son "elige cualquier nombre de estado" — son
+// pasos concretos del workflow del ticket, identificados por un ID propio,
+// y solo las que de verdad están disponibles desde el estado actual. Por
+// eso las consultamos en vivo en vez de dejar que el usuario escriba un
+// nombre de estado a mano.
+ipcMain.handle('jira:listTransitions', async (event, { key }) => {
+  const { jira } = loadConfig();
+  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  try {
+    const res = await httpRequest({
+      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/transitions`,
+      headers: jiraAuthHeader(jira),
+      rejectUnauthorized: jira.verifySsl !== false,
+    });
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
+    return { ok: true, transitions: (res.body && res.body.transitions) || [] };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('jira:doTransition', async (event, { key, transitionId }) => {
+  const { jira } = loadConfig();
+  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  try {
+    // Jira devuelve el id de cada transición disponible como STRING en el
+    // JSON (p.ej. "731"), pero al ENVIAR la transición exige que sea un
+    // entero JSON real, sin comillas — si se reenvía tal cual se recibió,
+    // Jira responde 400 con "'transition' identifier must be an integer".
+    const numericId = parseInt(transitionId, 10);
+    if (Number.isNaN(numericId)) return { ok: false, error: `Invalid transition id: ${transitionId}` };
+    const res = await httpRequest({
+      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${key}/transitions`,
+      method: 'POST',
+      headers: jiraAuthHeader(jira),
+      body: { transition: { id: numericId } },
+      rejectUnauthorized: jira.verifySsl !== false,
+    });
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// ── Automation Templates: CRUD sobre el vault ───────────────────────────
+ipcMain.handle('automation:list', async () => {
+  const cfg = loadConfig();
+  return { ok: true, templates: cfg.automationTemplates || [] };
+});
+
+ipcMain.handle('automation:save', async (event, { template }) => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  const cfg = loadConfig();
+  cfg.automationTemplates = cfg.automationTemplates || [];
+  const id = template.id || crypto.randomUUID();
+  const stored = { ...template, id };
+  const idx = cfg.automationTemplates.findIndex((t) => t.id === id);
+  if (idx >= 0) cfg.automationTemplates[idx] = stored;
+  else cfg.automationTemplates.push(stored);
+  const saveRes = saveConfig(cfg);
+  if (!saveRes.ok) return { ok: false, error: `Could not save to disk: ${saveRes.error}` };
+  return { ok: true, id };
+});
+
+ipcMain.handle('automation:delete', async (event, { id }) => {
+  const cfg = loadConfig();
+  cfg.automationTemplates = (cfg.automationTemplates || []).filter((t) => t.id !== id);
+  saveConfig(cfg);
+  return { ok: true };
+});
+
+// ── Cola de adjuntos pendientes ──────────────────────────────────────────
+// Cuando una rama (success/failure) requiere adjunto y el job termina sin
+// que el usuario esté mirando esa pantalla, no interrumpimos con un modal
+// — encolamos la pendiente aquí, y el frontend la muestra como badge/
+// notificación hasta que el usuario decide atenderla.
+ipcMain.handle('automation:listPendingAttachments', async () => {
+  const cfg = loadConfig();
+  return { ok: true, pending: cfg.pendingAttachments || [] };
+});
+
+ipcMain.handle('automation:addPendingAttachment', async (event, { pending }) => {
+  const cfg = loadConfig();
+  cfg.pendingAttachments = cfg.pendingAttachments || [];
+  const stored = { ...pending, id: crypto.randomUUID(), createdAt: Date.now() };
+  cfg.pendingAttachments.push(stored);
+  saveConfig(cfg);
+  return { ok: true, id: stored.id };
+});
+
+ipcMain.handle('automation:resolvePendingAttachment', async (event, { id }) => {
+  const cfg = loadConfig();
+  cfg.pendingAttachments = (cfg.pendingAttachments || []).filter((p) => p.id !== id);
+  saveConfig(cfg);
+  return { ok: true };
+});
+
+// Abre el selector nativo de archivo, lee el contenido del disco y lo sube
+// directamente a Jira — usado por el modal de adjuntos pendientes, donde el
+// usuario elige manualmente qué archivo de su PC adjuntar al ticket.
+function guessMimeType(filename) {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  const map = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+    pdf: 'application/pdf', html: 'text/html', htm: 'text/html', txt: 'text/plain',
+    json: 'application/json', zip: 'application/zip', csv: 'text/csv', log: 'text/plain',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+ipcMain.handle('automation:pickAndUploadAttachment', async (event, { ticketKey }) => {
+  const { jira } = loadConfig();
+  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  const { filePaths, canceled } = await dialog.showOpenDialog({ properties: ['openFile'] });
+  if (canceled || filePaths.length === 0) return { ok: false, canceled: true };
+
+  const filePath = filePaths[0];
+  const filename = path.basename(filePath);
+  const mimeType = guessMimeType(filename);
+
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(`${jira.url.replace(/\/$/, '')}/rest/api/2/issue/${ticketKey}/attachments`);
+    } catch (e) {
+      resolve({ ok: false, error: 'URL de Jira inválida' });
+      return;
+    }
+    const boundary = '----CorexBoundary' + Date.now();
+    const fileBuffer = fs.readFileSync(filePath);
+    const prePart = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+    );
+    const postPart = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([prePart, fileBuffer, postPart]);
+
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname,
+        method: 'POST',
+        headers: {
+          ...jiraAuthHeader(jira),
+          'X-Atlassian-Token': 'no-check',
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length,
+        },
+        rejectUnauthorized: jira.verifySsl !== false,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            resolve({ ok: false, error: `HTTP ${res.statusCode}: ${data}` });
+            return;
+          }
+          resolve({ ok: true, filename });
+        });
+      }
+    );
+    req.on('error', (err) => resolve({ ok: false, error: err.message }));
+    req.write(body);
+    req.end();
+  });
 });
