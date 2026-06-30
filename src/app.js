@@ -40,6 +40,21 @@ let state = {
   hwLoading: false,
   hwError: null,
   hwPollHandle: null,
+  // Polling de listas en vivo — Jira/AWX, cada 15s mientras esa vista está
+  // activa (mismo patrón que hwPollHandle: arranca al entrar, para al
+  // salir, decisión centralizada en renderApp() para no poder "olvidar"
+  // pararlo al navegar a un detalle).
+  jiraListPollHandle: null,
+  awxListPollHandle: null,
+  // Detección de pérdida de conexión real — navigator.onLine solo confirma
+  // "hay algún adaptador de red activo", no conectividad real con Jira/AWX
+  // (una VPN caída con WiFi conectado sigue dando onLine:true). En vez de
+  // eso, contamos fallos de red CONSECUTIVOS del polling que ya existe: un
+  // timeout puntual es ruido normal, pero 3 seguidos del mismo canal sí es
+  // señal real de que algo está caído. Por canal, no global, porque Jira y
+  // AWX pueden estar en redes distintas y fallar de forma independiente.
+  consecutiveNetworkFailures: { jira: 0, awx: 0 },
+  connectionLostBanner: null, // null | 'jira' | 'awx' | 'both'
   // Historial para las gráficas en tiempo real — buffer de hasta 1h a una
   // muestra cada 3s (1200 puntos). La ventana visible (60s/5m/1h) solo
   // recorta una porción de este mismo buffer, no cambia el intervalo de
@@ -77,15 +92,25 @@ let state = {
 
   // Vista de detalle de Ticket (view: 'jira-detail')
   jiraDetailIssue: null,
-  jiraDetailReturnView: 'inbox',
+  jiraDetailReturnView: 'inbox', // a qué VISTA volver al salir del todo (jira/awx-detail/inbox)
+  // Pila de tickets visitados dentro de la navegación detalle→detalle
+  // (parent/sub-task/linked issue). Sin esto, "volver" solo recordaba la
+  // vista de origen (Jira/AWX/Dashboard), así que saltar Padre→Hijo→Padre
+  // perdía el rastro y "volver" siempre caía en la lista general en vez
+  // del ticket anterior real.
+  jiraDetailHistory: [],
   jiraCommentDraft: '',
   jiraCommentSending: false,
-  jiraAttachSending: false,
+  jiraManualAttachSending: false,
   // Secciones colapsables de campos extra (p.ej. Business Justification) —
   // colapsadas por defecto porque suelen traer texto largo (listas de
   // servidores, justificaciones extensas) que no debería invadir la
   // pantalla de entrada al detalle.
   jiraDetailExpandedFields: {},
+  jiraDetailStatusMenuOpen: false,
+  jiraDetailTransitions: [],
+  jiraDetailTransitionsLoading: false,
+  jiraDetailThumbnails: {}, // { attachmentId: dataUrl } — cache en memoria, se vuelve a pedir al reabrir el detalle
 
   // Vault global — pantalla de bienvenida bloqueante antes de toda la app
   vaultUnlocked: false,
@@ -139,6 +164,22 @@ let state = {
   ctMacroBuffer: '', // teclas acumuladas durante la grabación en curso
   ctMacros: [], // [{ id, name, keys }] — persistidas en el vault
   ctShowMacroPanel: false,
+
+  // Ticket Automation Templates (System → Templates)
+  automationTemplates: [], // [{ id, name, awxTemplateId, onSuccess, onFailure }]
+  pendingAttachments: [], // [{ id, ticketKey, jobId, jobName, status, isParent, createdAt }]
+  automationEditingId: null, // null = lista, 'new' = creando, id = editando existente
+  automationForm: null,
+  automationAwxFilter: '', // texto del buscador de templates AWX dentro del editor
+  automationVarPickerOpenFor: null, // qué textarea tiene el selector de variables abierto ('success'|'failure'|'parentSuccess'|'parentFailure')
+  showPendingAttachmentsModal: false,
+  // Banners persistentes — distintos del toast normal (que se autoborra):
+  // se quedan fijos en pantalla hasta que el usuario los cierre o actúe,
+  // uno por cada adjunto que pasó a la cola de pendientes. Array porque
+  // pueden acumularse si terminan varios jobs antes de que el usuario
+  // atienda el primero.
+  persistentBanners: [], // [{ id, ticketKey, jobName }]
+  resolvingPendingAttachmentId: null,
 
   // VS Corex (view: 'vscorex')
   vsMonacoLoaded: false,
@@ -211,6 +252,14 @@ function mk(tag, styleOrAttrs, children, attrs) {
         else if (k === 'class') el.className = v;
         else if (k === 'text') el.textContent = v;
         else if (k === 'html') el.innerHTML = v;
+        // selected/checked/disabled son atributos BOOLEANOS por presencia en
+        // HTML: setAttribute('selected', 'false') sigue activando la
+        // selección porque el navegador solo mira si el atributo existe, no
+        // su texto. Esto causaba que SIEMPRE quedara seleccionada la última
+        // <option> de una lista generada con .forEach(), sin importar cuál
+        // elegía el usuario. Usar la propiedad del DOM (el.selected = v) es
+        // lo correcto: true la activa, false la desactiva de verdad.
+        else if (k === 'selected' || k === 'checked' || k === 'disabled') el[k] = !!v;
         else el.setAttribute(k, v);
       });
     } else {
@@ -298,6 +347,11 @@ function renderSidebar() {
     '<path d="M15 7 L20 12 L15 17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>' +
     '</svg>';
 
+  const iconTemplates = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M4 5 H20 V19 H4 Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '<path d="M4 9 H20 M9 9 V19" stroke="currentColor" stroke-width="1.5"/>' +
+    '</svg>';
+
   const sections = [
     {
       label: 'Operations',
@@ -317,6 +371,7 @@ function renderSidebar() {
     {
       label: 'System',
       items: [
+        { id: 'templates', label: 'Templates', iconSvg: iconTemplates, badge: state.pendingAttachments.length || null },
         { id: 'settings', label: t('nav_settings'), icon: '⚒' },
       ],
     },
@@ -416,6 +471,11 @@ function renderSidebar() {
           if (it.id === 'jira' && state.inboxIssues.length === 0) loadInbox();
           if (it.id === 'corexterm' && state.ctSessions.length === 0) loadCtSessions();
           if (it.id === 'vscorex') initVsCorex();
+          if (it.id === 'templates') {
+            loadAutomationTemplates();
+            loadPendingAttachments();
+            if (state.awxTemplates.length === 0) loadAwxTemplates();
+          }
         },
       }, [
         it.iconSvg
@@ -424,12 +484,23 @@ function renderSidebar() {
         mk('span', {}, [it.label]),
       ]);
       if (it.badge) {
-        row.appendChild(mk('span', {
+        // El badge de "Templates" (adjuntos pendientes) abre el modal
+        // directamente con un clic, sin tener que navegar primero a esa
+        // vista — es una notificación persistente real, accesible desde
+        // cualquier parte de la app, no solo un contador informativo.
+        const badgeIsPendingAttachments = it.id === 'templates';
+        const badgeProps = {
           style: {
             marginLeft: 'auto', fontSize: T.xs, background: '#1c2a1f', color: C.success,
             padding: '1px 6px', borderRadius: R.pill, fontWeight: '700',
+            cursor: badgeIsPendingAttachments ? 'pointer' : 'default',
           },
-        }, [String(it.badge)]));
+        };
+        if (badgeIsPendingAttachments) {
+          badgeProps.title = 'Open pending attachments';
+          badgeProps.onclick = (e) => { e.stopPropagation(); state.showPendingAttachmentsModal = true; renderApp(); };
+        }
+        row.appendChild(mk('span', badgeProps, [String(it.badge)]));
       }
       content.appendChild(row);
     });
@@ -476,6 +547,77 @@ function renderToast() {
   }, [state.toast.msg]);
 }
 
+// Banners persistentes — distintos del toast: NO se autoborran. Se apilan
+// encima de donde aparecería el toast normal (que vive más abajo, en
+// bottom:24px) para que no se solapen si ambos están visibles a la vez.
+// Cada uno tiene su propio botón de acción (abre el modal directamente,
+// ya filtrado a ese pendiente) y su propio cierre.
+// Banner de "sin conexión" — arriba de la pantalla, no abajo junto a los
+// banners de adjuntos pendientes: esto es más urgente (explica por qué
+// nada se está actualizando) y debe verse de inmediato sin competir por
+// espacio. No tiene botón de cerrar — desaparece solo en cuanto la
+// conexión vuelve, porque ocultarlo manualmente mientras sigue caída
+// dejaría al usuario sin saber por qué las listas no se mueven.
+function renderConnectivityBanner() {
+  if (!state.connectionLostBanner) return null;
+  const labels = { jira: 'Jira', awx: 'AWX', both: 'Jira and AWX' };
+  return mk('div', {
+    style: {
+      position: 'fixed', top: '0', left: '0', right: '0', zIndex: '1000',
+      background: '#3a1414', borderBottom: '1px solid #6b2b2b', color: '#e0a0a0',
+      padding: '8px 16px', fontSize: '12.5px', textAlign: 'center', fontWeight: '600',
+    },
+  }, [
+    `⚠ Connection lost to ${labels[state.connectionLostBanner]} — retrying automatically every 15s`,
+  ]);
+}
+
+function renderPersistentBanners() {
+  if (state.persistentBanners.length === 0) return null;
+  const stack = mk('div', {
+    style: {
+      position: 'fixed', bottom: '76px', right: '24px', zIndex: '998',
+      display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-end',
+    },
+  });
+  state.persistentBanners.forEach((banner) => {
+    const card = mk('div', {
+      style: {
+        background: '#1a1508', border: '1px solid #6b5320', borderRadius: '4px',
+        padding: '12px 14px', maxWidth: '340px', boxShadow: '0 8px 24px #00000066',
+      },
+    });
+    const headerRow = mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px', marginBottom: '8px' } });
+    headerRow.appendChild(mk('div', { style: { fontSize: '12.5px', color: '#dba458', fontWeight: '700' } }, [
+      `${banner.ticketKey} needs an attachment`,
+    ]));
+    headerRow.appendChild(mk('span', {
+      style: { fontSize: '13px', color: '#8a703a', cursor: 'pointer', flexShrink: '0', lineHeight: '1' },
+      onclick: () => dismissPersistentBanner(banner.id),
+    }, ['×']));
+    card.appendChild(headerRow);
+    card.appendChild(mk('div', { style: { fontSize: '11px', color: '#9aa0a6', marginBottom: '10px' } }, [banner.jobName]));
+    card.appendChild(mk('button', {
+      style: {
+        background: '#dba458', color: '#0a0b0d', border: 'none', borderRadius: '3px',
+        padding: '6px 14px', fontSize: '11.5px', fontWeight: '700', cursor: 'pointer',
+      },
+      onclick: () => {
+        dismissPersistentBanner(banner.id);
+        state.showPendingAttachmentsModal = true;
+        renderApp();
+      },
+    }, ['Attach now →']));
+    stack.appendChild(card);
+  });
+  return stack;
+}
+
+function dismissPersistentBanner(id) {
+  state.persistentBanners = state.persistentBanners.filter((b) => b.id !== id);
+  renderApp();
+}
+
 function renderApp() {
   const app = document.getElementById('app');
 
@@ -498,6 +640,22 @@ function renderApp() {
     if (!state.hwPollHandle) startHwPolling();
   } else {
     stopHwPolling();
+  }
+
+  // Mismo patrón para las listas de Jira y AWX — Inbox y Jira comparten el
+  // mismo dato (state.inboxIssues), así que ambas vistas mantienen vivo el
+  // polling de tickets. Sin esto, cerrar un ticket desde Jira directamente
+  // (fuera de COREX) nunca se reflejaba hasta recargar la app entera.
+  if (state.view === 'inbox' || state.view === 'jira') {
+    if (!state.jiraListPollHandle) startJiraListPolling();
+  } else {
+    stopJiraListPolling();
+  }
+
+  if (state.view === 'awx') {
+    if (!state.awxListPollHandle) startAwxListPolling();
+  } else {
+    stopAwxListPolling();
   }
 
   // Reconstruimos todo el DOM en cada render (no hay virtual DOM), así que sin
@@ -538,6 +696,7 @@ function renderApp() {
   else if (state.view === 'jira-detail') main.appendChild(renderJiraDetailView());
   else if (state.view === 'corexterm') main.appendChild(renderCorexTermView());
   else if (state.view === 'vscorex') main.appendChild(renderVsCorexView());
+  else if (state.view === 'templates') main.appendChild(renderTemplatesView());
   else if (state.view === 'settings') main.appendChild(renderSettingsView());
 
   layout.appendChild(main);
@@ -560,6 +719,16 @@ function renderApp() {
 
   const t = renderToast();
   if (t) app.appendChild(t);
+
+  const connectivityBanner = renderConnectivityBanner();
+  if (connectivityBanner) app.appendChild(connectivityBanner);
+
+  const banners = renderPersistentBanners();
+  if (banners) app.appendChild(banners);
+
+  if (state.showPendingAttachmentsModal) {
+    app.appendChild(renderPendingAttachmentsModal());
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
@@ -568,6 +737,21 @@ function renderApp() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function checkVaultGate() {
+  // Ctrl+R / F5 recarga solo el renderer (este frontend), no el proceso
+  // main de Electron — así que si el vault ya estaba desbloqueado antes
+  // del refresco, el backend (vaultDataCache) sigue teniéndolo en memoria
+  // aunque este frontend haya perdido su propio state.vaultUnlocked. Sin
+  // esta consulta, cada Ctrl+R pedía la master password de nuevo de forma
+  // innecesaria, aunque el vault nunca llegó a re-bloquearse de verdad.
+  const unlockedRes = await window.corexAPI.vaultIsUnlocked();
+  if (unlockedRes.unlocked) {
+    state.vaultExists = true;
+    state.vaultUnlocked = true;
+    await loadAllAfterUnlock();
+    renderApp();
+    return;
+  }
+
   const res = await window.corexAPI.vaultExists();
   state.vaultExists = res.exists;
   renderApp();
@@ -619,6 +803,8 @@ async function loadAllAfterUnlock() {
   state.templateUsage = await window.corexAPI.templateUsageGet();
   await loadCtSessions();
   await loadCtMacros();
+  await loadAutomationTemplates();
+  await loadPendingAttachments();
 
   if (state.view === 'inbox' && state.config.jira && state.config.jira.url) {
     loadInbox();
@@ -701,6 +887,38 @@ async function init() {
   await checkVaultGate();
 }
 
+// Red de seguridad del frontend: sin esto, cualquier promesa rechazada sin
+// .catch() o cualquier excepción de JS que se escape de los try/catch ya
+// existentes desaparece en silencio — la app puede quedar en un estado a
+// medio actualizar (un botón que no responde, un modal que no cierra) sin
+// ningún indicio de qué pasó. Mostramos un toast de error genérico (no
+// queremos asumir qué se rompió) y lo logueamos a consola para diagnóstico.
+//
+// El guard handlingGlobalError es importante: si el error que se capturó
+// aquí ocurrió DENTRO de renderApp() (un bug real al construir alguna
+// vista), entonces toast() —que también llama a renderApp()— dispararía
+// el mismo fallo otra vez, re-entrando en este mismo handler sin parar.
+// Sin el guard sería un bucle infinito real, no solo teórico.
+let handlingGlobalError = false;
+function reportGlobalError(source, detail) {
+  console.error(`[COREX] ${source}:`, detail);
+  if (handlingGlobalError) return; // ya estamos en medio de reportar uno, no reentrar
+  handlingGlobalError = true;
+  try {
+    toast('Something went wrong — check the console for details', 'err');
+  } catch (e) {
+    console.error('[COREX] Failed to show error toast (renderApp itself may be broken):', e);
+  } finally {
+    handlingGlobalError = false;
+  }
+}
+window.addEventListener('unhandledrejection', (event) => {
+  reportGlobalError('Unhandled promise rejection', event.reason);
+});
+window.addEventListener('error', (event) => {
+  reportGlobalError('Uncaught error', event.error || event.message);
+});
+
 init();
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -711,11 +929,26 @@ async function loadAwxTemplates() {
   state.awxLoading = true;
   state.awxError = null;
   renderApp();
-
-  const res = await window.corexAPI.awxListJobTemplates();
+  await refreshAwxTemplatesSilently();
   state.awxLoading = false;
+  renderApp();
+}
+
+// Refresco silencioso para el polling de 15s — sin tocar awxLoading, mismo
+// motivo que refreshInboxSilently: evitar el parpadeo de "Loading..." en
+// cada ciclo cuando la lista ya está visible.
+async function refreshAwxTemplatesSilently() {
+  const res = await window.corexAPI.awxListJobTemplates();
+  trackConnectivity('awx', res);
   if (!res.ok) {
     state.awxError = res.error;
+    if (res.isAuthError) {
+      // Credenciales caducadas: reintentar cada 15s no arregla nada, solo
+      // genera ruido. Paramos el polling — el usuario tiene que ir a
+      // Settings; al volver a esta vista, el polling arranca de cero.
+      stopAwxListPolling();
+      toast('AWX authentication failed — check your credentials in Settings', 'err');
+    }
   } else {
     state.awxTemplates = res.results;
   }
@@ -951,7 +1184,7 @@ function renderOtherPromptsStep(wizard) {
     wrap.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '4px', marginTop: '10px' } }, ['Inventory']));
     const select = mk('select', {
       style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '13px' },
-      onchange: (e) => { op.inventory = Number(e.target.value) || null; },
+      onchange: (e) => { op.inventory = Number(e.target.value) || null; renderApp(); },
     }, [mk('option', { value: '' }, ['(template default)'])]);
     wizard.inventories.forEach((inv) => {
       select.appendChild(mk('option', { value: String(inv.id), selected: op.inventory === inv.id }, [inv.name]));
@@ -977,7 +1210,7 @@ function renderOtherPromptsStep(wizard) {
     wrap.appendChild(mk('label', { style: { fontSize: '11px', color: '#5e6670', display: 'block', marginBottom: '4px', marginTop: '10px' } }, ['Execution Environment']));
     const select = mk('select', {
       style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '13px' },
-      onchange: (e) => { op.execution_environment = Number(e.target.value) || null; },
+      onchange: (e) => { op.execution_environment = Number(e.target.value) || null; renderApp(); },
     }, [mk('option', { value: '' }, ['(template default)'])]);
     wizard.executionEnvironments.forEach((ee) => {
       select.appendChild(mk('option', { value: String(ee.id), selected: op.execution_environment === ee.id }, [ee.name]));
@@ -1004,7 +1237,7 @@ function renderSurveyStep(wizard) {
     if (q.type === 'multiplechoice' || q.type === 'multiselect') {
       const select = mk('select', {
         style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '13px' },
-        onchange: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; },
+        onchange: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; renderApp(); },
       });
       (q.choices || []).forEach((choice) => {
         select.appendChild(mk('option', { value: choice, selected: wizard.surveyAnswers[q.variable] === choice }, [choice]));
@@ -1022,7 +1255,7 @@ function renderSurveyStep(wizard) {
         },
         placeholder: q.default || '',
         'data-focus-key': `survey-${q.variable}`,
-        oninput: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; },
+        oninput: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; renderApp(); },
       });
       // A diferencia de <input>, un <textarea> no tiene atributo "value" —
       // su contenido inicial hay que asignarlo a la propiedad .value del
@@ -1037,7 +1270,7 @@ function renderSurveyStep(wizard) {
         type: q.type === 'password' ? 'password' : q.type === 'integer' || q.type === 'float' ? 'number' : 'text',
         placeholder: q.default || '',
         value: wizard.surveyAnswers[q.variable] || '',
-        oninput: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; },
+        oninput: (e) => { wizard.surveyAnswers[q.variable] = e.target.value; renderApp(); },
       }));
     }
     wrap.appendChild(col);
@@ -1165,18 +1398,137 @@ async function pollAwxJob(jobId) {
   const finished = jobRes.ok && ['successful', 'failed', 'error', 'canceled'].includes(jobRes.job.status);
   if (finished) {
     stopAwxPolling();
-    onAwxJobFinished(jobRes.job);
+    await onAwxJobFinished(jobRes.job);
   }
   renderApp();
 }
 
-// Hook: cuando el job termina, aquí enganchamos comentario/adjunto/correo más adelante
-function onAwxJobFinished(job) {
+// Cuando un job vinculado a un ticket termina, buscamos si existe una
+// Automation Template asociada a ESE TEMPLATE DE AWX (no al ticket — así
+// cualquier ticket que dispare ese mismo template hereda la automatización
+// sin tener que configurarla ticket por ticket) y ejecutamos la rama
+// success/failure correspondiente: comentario (interno si es fallo, público
+// si es éxito), transición de estado, y encolado de adjunto pendiente si la
+// plantilla lo requiere. Todo esto se replica opcionalmente en el ticket
+// padre, según lo que la plantilla defina.
+async function onAwxJobFinished(job) {
   const ok = job.status === 'successful';
   toast(
     ok ? t('awx_job_finished_ok', { id: job.id }) : t('awx_job_finished_status', { id: job.id, status: job.status }),
     ok ? 'ok' : 'err'
   );
+
+  const ticketKey = state.awxRunningJobTicketKey;
+  if (!ticketKey) return; // job lanzado sin ticket vinculado, nada que automatizar
+
+  const link = state.ticketLinks[ticketKey];
+  if (!link) return;
+
+  if (state.automationTemplates.length === 0) {
+    await loadAutomationTemplates();
+  }
+  const auto = state.automationTemplates.find((a) => a.awxTemplateId === link.templateId);
+  if (!auto) return; // este template no tiene automatización configurada, comportamiento manual de siempre
+
+  const branch = ok ? auto.onSuccess : auto.onFailure;
+  if (!branch || !branch.enabled) return;
+
+  await runAutomationBranch(ticketKey, branch, job, { isParent: false });
+
+  if (branch.parentBehavior && branch.parentBehavior !== 'none') {
+    const issueRes = await window.corexAPI.jiraGetIssue(ticketKey);
+    const parentKey = issueRes.ok && issueRes.issue.fields && issueRes.issue.fields.parent && issueRes.issue.fields.parent.key;
+    if (parentKey) {
+      await runAutomationBranch(parentKey, branch, job, { isParent: true });
+    }
+  }
+}
+
+// Ejecuta una rama (success u failure) de la automatización sobre un ticket
+// concreto (hijo o padre): comenta, transiciona, y encola adjunto si aplica.
+async function runAutomationBranch(ticketKey, branch, job, { isParent }) {
+  const vars = buildAutomationVars(job);
+  const commentTemplate = isParent ? (branch.parentCommentTemplate || branch.commentTemplate) : branch.commentTemplate;
+  const isInternal = !job || job.status !== 'successful'; // fallo = interno, éxito = público, según se confirmó
+
+  if (commentTemplate) {
+    const body = renderAutomationTemplate(commentTemplate, vars);
+    const res = await window.corexAPI.jiraAddComment(ticketKey, body, isInternal);
+    if (!res.ok) toast(`Automation: comment failed on ${ticketKey}: ${res.error}`, 'err');
+  }
+
+  const transitionStatusName = isParent ? branch.parentTransitionStatusName : branch.transitionStatusName;
+  if (transitionStatusName && transitionStatusName.trim()) {
+    await resolveAndDoTransition(ticketKey, transitionStatusName.trim());
+  }
+
+  const needsAttachment = isParent ? branch.parentRequireAttachment : branch.requireAttachment;
+  if (needsAttachment) {
+    const pendingRes = await window.corexAPI.automationAddPendingAttachment({
+      ticketKey,
+      jobId: job.id,
+      jobName: job.name || job.job_template_name || `Job #${job.id}`,
+      status: job.status,
+      isParent,
+    });
+    await loadPendingAttachments();
+    toast(`Attachment needed for ${ticketKey} — see pending attachments`, 'ok');
+    // Banner persistente — el toast de arriba se autoborra a los pocos
+    // segundos y es fácil perdérselo; esto se queda fijo en pantalla hasta
+    // que el usuario lo cierre o pulse para abrir el modal directamente.
+    state.persistentBanners.push({
+      id: (pendingRes && pendingRes.id) || `${ticketKey}-${Date.now()}`,
+      ticketKey,
+      jobName: job.name || job.job_template_name || `Job #${job.id}`,
+    });
+    renderApp();
+  }
+}
+
+// Variables disponibles en las plantillas de mensaje — mismo concepto que
+// las variables de un survey, insertables con un clic en el constructor.
+// Busca, entre las transiciones REALES disponibles ahora mismo para este
+// ticket concreto, cuál lleva a un estado con el nombre indicado en la
+// plantilla — y la ejecuta. Si el ticket ya no puede llegar a ese estado
+// desde donde está (por ejemplo, si alguien ya lo movió a mano), avisa con
+// un error claro en vez de fallar en silencio o reventar.
+async function resolveAndDoTransition(ticketKey, targetStatusName) {
+  const transitionsRes = await window.corexAPI.jiraListTransitions(ticketKey);
+  if (!transitionsRes.ok) {
+    toast(`Automation: could not read transitions for ${ticketKey}: ${transitionsRes.error}`, 'err');
+    return;
+  }
+  const match = (transitionsRes.transitions || []).find((tr) => {
+    // El nombre de la transición y el nombre del estado destino no siempre
+    // coinciden (p.ej. transición "Resolve Issue" → estado "Done"), así que
+    // comparamos contra ambos para ser más permisivos.
+    const transitionName = (tr.name || '').toLowerCase();
+    const toStatusName = (tr.to && tr.to.name || '').toLowerCase();
+    const target = targetStatusName.toLowerCase();
+    return transitionName === target || toStatusName === target;
+  });
+  if (!match) {
+    const available = (transitionsRes.transitions || []).map((tr) => (tr.to && tr.to.name) || tr.name).join(', ');
+    toast(`Automation: ${ticketKey} has no transition to "${targetStatusName}" right now (available: ${available || 'none'})`, 'err');
+    return;
+  }
+  const res = await window.corexAPI.jiraDoTransition(ticketKey, match.id);
+  if (!res.ok) toast(`Automation: transition failed on ${ticketKey}: ${res.error}`, 'err');
+}
+
+function buildAutomationVars(job) {
+  return {
+    job_name: job.name || job.job_template_name || `Job #${job.id}`,
+    job_id: String(job.id),
+    status: job.status,
+    finished_at: job.finished ? new Date(job.finished).toLocaleString() : '',
+    duration: job.elapsed ? `${Math.round(job.elapsed)}s` : '',
+    requested_by: (job.summary_fields && job.summary_fields.created_by && job.summary_fields.created_by.username) || '',
+  };
+}
+
+function renderAutomationTemplate(template, vars) {
+  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (match, key) => (key in vars ? vars[key] : match));
 }
 
 function awxStatusColor(status) {
@@ -1449,11 +1801,21 @@ async function loadAwxRecentJobs() {
   state.awxRecentJobsLoading = true;
   state.awxRecentJobsError = null;
   renderApp();
-
-  const res = await window.corexAPI.awxGetRecentJobs(8);
+  await refreshAwxRecentJobsSilently();
   state.awxRecentJobsLoading = false;
+  renderApp();
+}
+
+async function refreshAwxRecentJobsSilently() {
+  if (!state.config.awx || !state.config.awx.url) return;
+  const res = await window.corexAPI.awxGetRecentJobs(8);
+  trackConnectivity('awx', res);
   if (!res.ok) {
     state.awxRecentJobsError = res.error;
+    if (res.isAuthError) {
+      stopAwxListPolling();
+      toast('AWX authentication failed — check your credentials in Settings', 'err');
+    }
   } else {
     state.awxRecentJobs = res.jobs;
   }
@@ -1563,7 +1925,7 @@ function renderAwxDetailView() {
       type: 'text',
       placeholder: 'OPS-1234',
       value: state.awxExtraVarsTicket,
-      oninput: (e) => { state.awxExtraVarsTicket = e.target.value; },
+      oninput: (e) => { state.awxExtraVarsTicket = e.target.value; renderApp(); },
     }));
     if (state.awxExtraVarsTicket.trim() && state.ticketLinks[state.awxExtraVarsTicket.trim()]) {
       launchBox.appendChild(mk('div', {
@@ -2042,6 +2404,63 @@ async function loadHwMetrics() {
   renderApp();
 }
 
+// Polling de la lista de tickets de Jira (Inbox y vista Jira comparten los
+// mismos datos: state.inboxIssues), cada 15s mientras esa vista esté activa.
+function startJiraListPolling() {
+  stopJiraListPolling();
+  state.jiraListPollHandle = setInterval(refreshInboxSilently, 15000);
+}
+
+// Umbral de fallos de red consecutivos antes de considerar la conexión
+// realmente perdida (no solo un timeout puntual, que es ruido normal).
+const NETWORK_FAILURE_THRESHOLD = 3;
+
+// Punto único que registra el resultado de cada ciclo de polling — éxito
+// resetea el contador del canal a 0, fallo de red lo incrementa. Cuando un
+// canal cruza el umbral, se refleja en connectionLostBanner; cuando vuelve
+// a tener éxito, desaparece de ahí automáticamente.
+function trackConnectivity(channel, res) {
+  if (res.ok) {
+    state.consecutiveNetworkFailures[channel] = 0;
+  } else if (res.isNetworkError) {
+    state.consecutiveNetworkFailures[channel]++;
+  }
+  // isAuthError no cuenta aquí — eso ya tiene su propio aviso (toast +
+  // parar el polling) y no es "sin conexión", es "credenciales caducadas
+  // con conexión perfectamente viva".
+
+  const jiraDown = state.consecutiveNetworkFailures.jira >= NETWORK_FAILURE_THRESHOLD;
+  const awxDown = state.consecutiveNetworkFailures.awx >= NETWORK_FAILURE_THRESHOLD;
+  if (jiraDown && awxDown) state.connectionLostBanner = 'both';
+  else if (jiraDown) state.connectionLostBanner = 'jira';
+  else if (awxDown) state.connectionLostBanner = 'awx';
+  else state.connectionLostBanner = null;
+}
+
+function stopJiraListPolling() {
+  if (state.jiraListPollHandle) {
+    clearInterval(state.jiraListPollHandle);
+    state.jiraListPollHandle = null;
+  }
+}
+
+// Polling de AWX (templates + jobs recientes), cada 15s mientras la vista
+// AWX esté activa.
+function startAwxListPolling() {
+  stopAwxListPolling();
+  state.awxListPollHandle = setInterval(() => {
+    refreshAwxTemplatesSilently();
+    refreshAwxRecentJobsSilently();
+  }, 15000);
+}
+
+function stopAwxListPolling() {
+  if (state.awxListPollHandle) {
+    clearInterval(state.awxListPollHandle);
+    state.awxListPollHandle = null;
+  }
+}
+
 function startHwPolling() {
   stopHwPolling();
   state.hwLoading = true;
@@ -2387,11 +2806,25 @@ async function loadInbox() {
   state.inboxLoading = true;
   state.inboxError = null;
   renderApp();
-
-  const res = await window.corexAPI.jiraSearchMyIssues();
+  await refreshInboxSilently();
   state.inboxLoading = false;
+  renderApp();
+}
+
+// Igual que loadInbox pero sin tocar inboxLoading — usado por el polling de
+// 15s para refrescar la lista en vivo sin que parpadee a "Loading..." cada
+// vez, que sería molesto si la lista ya está visible y solo cambió algo
+// (p.ej. un ticket que tú cerraste desde Jira directamente).
+async function refreshInboxSilently() {
+  if (!state.config.jira || !state.config.jira.url) return;
+  const res = await window.corexAPI.jiraSearchMyIssues();
+  trackConnectivity('jira', res);
   if (!res.ok) {
     state.inboxError = res.error;
+    if (res.isAuthError) {
+      stopJiraListPolling();
+      toast('Jira authentication failed — check your credentials in Settings', 'err');
+    }
   } else {
     state.inboxIssues = res.issues;
   }
@@ -2530,9 +2963,43 @@ function renderInboxView() {
 //  Jira — vista de detalle de ticket: info completa + comentar + adjuntar
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Entrada al detalle DESDE FUERA (lista de Jira, AWX, Dashboard, etc.) —
+// limpia la pila de navegación entre tickets, porque es un punto de
+// entrada nuevo, no continuación de un recorrido padre/hijo/relacionado.
 async function openJiraDetail(key, returnView) {
   state.jiraDetailReturnView = returnView || 'inbox';
+  state.jiraDetailHistory = [];
+  await loadJiraDetailIssue(key);
+}
+
+// Salto a un ticket RELACIONADO (parent, sub-task, issue link) desde dentro
+// del propio detalle — apila el ticket actual antes de saltar, para que
+// "← Back" pueda volver exactamente por donde vino, en vez de caer siempre
+// en la lista general de Jira.
+async function navigateToRelatedTicket(key) {
+  if (state.jiraDetailIssue) {
+    state.jiraDetailHistory.push(state.jiraDetailIssue.key);
+  }
+  await loadJiraDetailIssue(key);
+}
+
+// Botón "← Back": si hay tickets en la pila, vuelve al anterior; si no,
+// vuelve a la vista de origen (Jira/AWX/Dashboard) como antes.
+async function goBackFromJiraDetail() {
+  if (state.jiraDetailHistory.length > 0) {
+    const previousKey = state.jiraDetailHistory.pop();
+    await loadJiraDetailIssue(previousKey);
+  } else {
+    state.view = state.jiraDetailReturnView;
+    renderApp();
+  }
+}
+
+async function loadJiraDetailIssue(key) {
   state.jiraCommentDraft = '';
+  state.jiraDetailStatusMenuOpen = false;
+  state.jiraDetailExpandedFields = {};
+  state.jiraDetailThumbnails = {};
   state.view = 'jira-detail';
   state.jiraLoading = true;
   renderApp();
@@ -2543,17 +3010,17 @@ async function openJiraDetail(key, returnView) {
     state.jiraDetailIssue = res.issue;
   } else {
     toast(`Error: ${res.error}`, 'err');
-    state.view = returnView || 'inbox';
+    state.view = state.jiraDetailReturnView || 'inbox';
   }
   renderApp();
 }
 
-async function sendJiraComment() {
+async function sendJiraComment(internal) {
   if (!state.jiraDetailIssue || !state.jiraCommentDraft.trim()) return;
   state.jiraCommentSending = true;
   renderApp();
 
-  const res = await window.corexAPI.jiraAddComment(state.jiraDetailIssue.key, state.jiraCommentDraft.trim());
+  const res = await window.corexAPI.jiraAddComment(state.jiraDetailIssue.key, state.jiraCommentDraft.trim(), internal);
   state.jiraCommentSending = false;
   if (!res.ok) {
     toast(`${t('jira_detail_comment_failed')} ${res.error}`, 'err');
@@ -2570,25 +3037,33 @@ async function sendJiraComment() {
 // Adjunta el log/stdout del job más reciente vinculado a este ticket, como
 // un archivo .txt simple. (Cuando tengamos un generador de reportes HTML,
 // este es el punto donde se enchufa: mismo flujo, distinto contenido/filename.)
-async function attachJobOutputToJira() {
+// Adjunto manual: abre el selector nativo de archivo y sube directamente al
+// ticket actual — independiente del flujo automatizado de "Attach report"
+// (que solo adjunta el output de un job en ejecución). Reutiliza el mismo
+// backend ya construido para la cola de adjuntos pendientes de Automation
+// Templates, ya que ahí ya recibe cualquier ticketKey de forma genérica.
+async function attachManualFileToJira() {
   if (!state.jiraDetailIssue) return;
-  if (!state.awxStdout) {
-    toast(t('jira_detail_no_job_yet'), 'err');
-    return;
-  }
-  state.jiraAttachSending = true;
+  state.jiraManualAttachSending = true;
   renderApp();
 
-  const base64 = btoa(unescape(encodeURIComponent(state.awxStdout)));
-  const filename = `job-output-${state.awxRunningJob ? state.awxRunningJob.id : 'latest'}.txt`;
-  const res = await window.corexAPI.jiraAddAttachment(state.jiraDetailIssue.key, filename, base64);
-  state.jiraAttachSending = false;
-  if (!res.ok) {
-    toast(`${t('jira_detail_attach_failed')} ${res.error}`, 'err');
-  } else {
-    toast(t('jira_detail_attach_sent'), 'ok');
+  const res = await window.corexAPI.automationPickAndUploadAttachment(state.jiraDetailIssue.key);
+  state.jiraManualAttachSending = false;
+  if (res.canceled) {
+    renderApp();
+    return;
   }
-  renderApp();
+  if (!res.ok) {
+    toast(`Attach failed: ${res.error}`, 'err');
+    renderApp();
+    return;
+  }
+  toast(`Attached ${res.filename}`, 'ok');
+  // Recargar el ticket para que el adjunto nuevo aparezca en la lista con
+  // su miniatura — loadJiraDetailIssue (no openJiraDetail) porque esto es
+  // un refresco del ticket actual, no una entrada nueva: openJiraDetail
+  // limpiaría la pila de navegación entre tickets relacionados.
+  await loadJiraDetailIssue(state.jiraDetailIssue.key);
 }
 
 // Campos custom específicos de esta instancia de Jira (Solera). Si en otra
@@ -2718,14 +3193,167 @@ async function downloadJiraAttachment(att) {
   toast(`Saved to ${res.filePath}`, 'ok');
 }
 
+// ── Cambio de estado desde el detalle — mismo desplegable de transiciones
+// reales que ya usa la automatización, pero aquí lo abre directamente el
+// usuario al hacer clic en la píldora de estado.
+async function toggleStatusMenu() {
+  state.jiraDetailStatusMenuOpen = !state.jiraDetailStatusMenuOpen;
+  if (state.jiraDetailStatusMenuOpen) {
+    state.jiraDetailTransitionsLoading = true;
+    renderApp();
+    const res = await window.corexAPI.jiraListTransitions(state.jiraDetailIssue.key);
+    state.jiraDetailTransitionsLoading = false;
+    state.jiraDetailTransitions = res.ok ? res.transitions : [];
+    if (!res.ok) toast(`Could not load transitions: ${res.error}`, 'err');
+  }
+  renderApp();
+}
+
+async function applyTransitionFromDetail(transition) {
+  state.jiraDetailStatusMenuOpen = false;
+  renderApp();
+  const res = await window.corexAPI.jiraDoTransition(state.jiraDetailIssue.key, transition.id);
+  if (!res.ok) {
+    toast(`Transition failed: ${res.error}`, 'err');
+    return;
+  }
+  toast(`Moved to ${(transition.to && transition.to.name) || transition.name}`, 'ok');
+  // Recargar el ticket para reflejar el nuevo estado real — loadJiraDetailIssue,
+  // no openJiraDetail, por el mismo motivo: esto es un refresco, no una
+  // entrada nueva que deba limpiar la pila de navegación.
+  await loadJiraDetailIssue(state.jiraDetailIssue.key);
+}
+
+// ── Thumbnails de adjuntos imagen — se piden bajo demanda y se cachean en
+// memoria por id de adjunto, para no volver a descargarlas en cada render.
+async function loadAttachmentThumbnail(att) {
+  if (state.jiraDetailThumbnails[att.id]) return; // ya cacheada
+  if (!att.thumbnail) return; // Jira no siempre expone thumbnail (adjuntos no-imagen)
+  const res = await window.corexAPI.jiraFetchThumbnail(att.thumbnail, att.mimeType);
+  if (res.ok) {
+    state.jiraDetailThumbnails[att.id] = res.dataUrl;
+    renderApp();
+  }
+}
+
+// Color de la píldora de estado, basado en statusCategory (un campo
+// ESTÁNDAR de Jira con valores fijos: new/indeterminate/done — no
+// dependemos de adivinar nombres de estado específicos de cada workflow).
+function jiraStatusPillColor(status) {
+  const catKey = status && status.statusCategory && status.statusCategory.key;
+  if (catKey === 'done') return '#6ad17e';
+  if (catKey === 'indeterminate') return '#5b9bd5';
+  return '#5e6670'; // 'new' / sin categoría
+}
+
+function jiraPriorityPillColor(priority) {
+  const name = ((priority && priority.name) || '').toLowerCase();
+  if (name.includes('critical') || name.includes('highest') || name.includes('p1')) return '#c94f4f';
+  if (name.includes('high') || name.includes('p2')) return '#c98a3a';
+  if (name.includes('medium') || name.includes('p3')) return '#c9b23a';
+  return '#5e6670';
+}
+
+// Detecta automáticamente qué custom fields del ticket son texto legible
+// para una persona (texto corto/largo, número, fecha, selección simple
+// {name:...}/{value:...}) y descarta los que son metadatos internos de
+// workflow: JSON serializado dentro de un string (empieza por { o [),
+// arrays, objetos con muchas keys (blobs de integración como devSummaryJson
+// que vimos en tickets reales), o nombres de campo que delatan ruido
+// técnico (Checklist, Approval Id, AccuWork..., Json, etc.).
+const CUSTOM_FIELD_NOISE_NAME_PATTERN = /json|checklist|approval id|accuwork|devstatus|webhook|^sla|smart checklist/i;
+
+function isJsonLikeString(str) {
+  const trimmed = str.trim();
+  return trimmed.startsWith('{') || trimmed.startsWith('[');
+}
+
+function extractReadableCustomFields(fields, names) {
+  const results = [];
+  Object.keys(fields).forEach((key) => {
+    if (!key.startsWith('customfield_')) return;
+    const value = fields[key];
+    if (value == null || value === '') return;
+
+    const label = names[key] || key;
+    if (CUSTOM_FIELD_NOISE_NAME_PATTERN.test(label)) return;
+
+    let displayValue = null;
+
+    if (typeof value === 'string') {
+      if (isJsonLikeString(value)) return; // JSON serializado a mano dentro de un campo de texto
+      displayValue = value;
+    } else if (typeof value === 'number') {
+      displayValue = String(value);
+    } else if (Array.isArray(value)) {
+      // Arrays simples de strings/números son legibles (p.ej. multi-select
+      // de texto plano); arrays de objetos complejos (checklists con
+      // linkedIssueKey/mandatory, etc.) se descartan.
+      if (value.length === 0) return;
+      if (value.every((v) => typeof v === 'string' || typeof v === 'number')) {
+        displayValue = value.join(', ');
+      } else {
+        return;
+      }
+    } else if (typeof value === 'object') {
+      // Forma típica de un campo select/radio de Jira: { name: "..." } o
+      // { value: "..." }. Si el objeto tiene más estructura que eso, es
+      // casi seguro un campo de relación compleja (usuario, grupo con self
+      // URL, etc.) — los descartamos para no mostrar ruido tipo "[object]".
+      if (value.name && typeof value.name === 'string') displayValue = value.name;
+      else if (value.value && typeof value.value === 'string') displayValue = value.value;
+      else return;
+    } else {
+      return;
+    }
+
+    if (!displayValue || !displayValue.trim()) return;
+    results.push({ key, label, value: displayValue.trim() });
+  });
+  return results;
+}
+
 function renderJiraDetailView() {
   const issue = state.jiraDetailIssue;
   const wrap = mk('div', { style: { maxWidth: '760px' } });
 
-  wrap.appendChild(mk('div', {
-    style: { fontSize: '12px', color: '#dfe3e7', cursor: 'pointer', fontWeight: '600', marginBottom: '10px' },
-    onclick: () => { state.view = state.jiraDetailReturnView; renderApp(); },
-  }, ['← ' + (state.jiraDetailReturnView === 'jira' ? t('nav_jira') : state.jiraDetailReturnView === 'awx-detail' ? t('nav_awx') : t('nav_inbox'))]));
+  // Botón de volver — si venimos de saltar entre tickets relacionados
+  // (parent/sub-task/linked issue), dice exactamente a qué ticket vuelve en
+  // vez de un genérico "← Jira" que siempre caía en la lista general. Si la
+  // pila tiene más de un salto, se muestra además el camino completo como
+  // breadcrumb, para que sea evidente cómo se llegó hasta aquí.
+  const hasHistory = state.jiraDetailHistory.length > 0;
+  const originLabel = state.jiraDetailReturnView === 'jira' ? t('nav_jira')
+    : state.jiraDetailReturnView === 'awx-detail' ? t('nav_awx')
+    : t('nav_inbox');
+
+  const backRow = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', marginBottom: '10px' } });
+  backRow.appendChild(mk('span', {
+    style: { fontSize: '12px', color: '#dfe3e7', cursor: 'pointer', fontWeight: '600' },
+    onclick: () => goBackFromJiraDetail(),
+  }, [hasHistory ? `← Back to ${state.jiraDetailHistory[state.jiraDetailHistory.length - 1]}` : `← ${originLabel}`]));
+
+  if (hasHistory) {
+    // Breadcrumb completo: Origen / Ticket1 / Ticket2 / ... — cada eslabón
+    // navega directo a ese punto, recortando la pila hasta ahí.
+    backRow.appendChild(mk('span', { style: { fontSize: '11px', color: '#3a3f44' } }, ['·']));
+    backRow.appendChild(mk('span', {
+      style: { fontSize: '11px', color: '#5e6670', cursor: 'pointer' },
+      onclick: () => { state.jiraDetailHistory = []; state.view = state.jiraDetailReturnView; renderApp(); },
+    }, [originLabel]));
+    state.jiraDetailHistory.forEach((key, i) => {
+      backRow.appendChild(mk('span', { style: { fontSize: '11px', color: '#3a3f44' } }, ['/']));
+      backRow.appendChild(mk('span', {
+        style: { fontSize: '11px', color: '#5e6670', cursor: 'pointer' },
+        onclick: async () => {
+          const targetKey = state.jiraDetailHistory[i];
+          state.jiraDetailHistory = state.jiraDetailHistory.slice(0, i);
+          await loadJiraDetailIssue(targetKey);
+        },
+      }, [key]));
+    });
+  }
+  wrap.appendChild(backRow);
 
   if (state.jiraLoading || !issue) {
     wrap.appendChild(mk('div', { style: { color: '#5e6670', fontSize: '13px' } }, [t('jira_loading')]));
@@ -2735,16 +3363,18 @@ function renderJiraDetailView() {
   const f = issue.fields || {};
   const link = state.ticketLinks[issue.key];
 
-  // ── Breadcrumb del ticket padre, si existe — destacado para que sea
-  // imposible no notarlo, no un gris apagado que se confunde con metadata.
+  // ── Badge del ticket padre — información de jerarquía pura, no
+  // navegación: el botón "← Back" de arriba ya cubre esa acción. Antes
+  // ambos hacían lo mismo (ir al padre) y quedaban casi superpuestos en
+  // pantalla, lo cual era redundante y confuso.
   if (f.parent) {
     wrap.appendChild(mk('div', {
       style: {
         display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#5b9bd5',
-        marginBottom: '10px', cursor: 'pointer', background: '#0d1620', border: '1px solid #1d3a5a',
-        borderRadius: '4px', padding: '6px 10px', width: 'fit-content',
+        marginBottom: '10px', background: '#0d1620', border: '1px solid #1d3a5a',
+        borderRadius: '4px', padding: '6px 10px', width: 'fit-content', cursor: 'pointer',
       },
-      onclick: () => openJiraDetail(f.parent.key, state.jiraDetailReturnView),
+      onclick: () => navigateToRelatedTicket(f.parent.key),
     }, [
       '↳ Sub-task of ',
       mk('span', { style: { fontWeight: '700' } }, [f.parent.key]),
@@ -2753,19 +3383,74 @@ function renderJiraDetailView() {
   }
 
   wrap.appendChild(mk('div', { style: { fontSize: '12px', color: '#dfe3e7', fontWeight: '700', marginBottom: '4px' } }, [issue.key]));
-  wrap.appendChild(mk('h1', { style: { fontSize: '19px', fontWeight: '700', color: '#dfe3e7', marginBottom: '10px' } }, [f.summary || '(untitled)']));
+  wrap.appendChild(mk('h1', { style: { fontSize: '19px', fontWeight: '700', color: '#dfe3e7', marginBottom: '12px' } }, [f.summary || '(untitled)']));
 
-  // ── Metadatos: estado, assignee, reporter, assignment group ──
-  const assignmentGroup = f[JIRA_CUSTOM_FIELDS.assignmentGroup];
-  const metaParts = [
-    `${t('jira_status_label')}: ${(f.status && f.status.name) || '—'}`,
-    `${t('jira_assignee_label')}: ${(f.assignee && f.assignee.displayName) || t('jira_unassigned')}`,
-    `Reporter: ${(f.reporter && f.reporter.displayName) || '—'}`,
-  ];
-  if (assignmentGroup) {
-    metaParts.push(`Group: ${typeof assignmentGroup === 'string' ? assignmentGroup : assignmentGroup.name}`);
+  // ── Píldoras: estado (clicable, abre transiciones reales) + prioridad ──
+  const pillRow = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px', position: 'relative', flexWrap: 'wrap' } });
+  const statusColor = jiraStatusPillColor(f.status);
+  const statusPill = mk('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11.5px', fontWeight: '700',
+      color: statusColor, background: `${statusColor}1a`, border: `1px solid ${statusColor}`,
+      borderRadius: '20px', padding: '4px 12px', cursor: 'pointer',
+    },
+    onclick: () => toggleStatusMenu(),
+  }, [
+    (f.status && f.status.name) || '—',
+    mk('span', { style: { fontSize: '9px' } }, ['▾']),
+  ]);
+  pillRow.appendChild(statusPill);
+
+  if (f.priority) {
+    const prColor = jiraPriorityPillColor(f.priority);
+    pillRow.appendChild(mk('div', {
+      style: {
+        fontSize: '11.5px', fontWeight: '700', color: prColor, background: `${prColor}1a`,
+        border: `1px solid ${prColor}`, borderRadius: '20px', padding: '4px 12px',
+      },
+    }, [f.priority.name]));
   }
-  wrap.appendChild(mk('div', { style: { fontSize: '12px', color: '#5e6670', marginBottom: '14px', lineHeight: '1.6' } }, [metaParts.join('   ·   ')]));
+
+  if (state.jiraDetailStatusMenuOpen) {
+    const menu = mk('div', {
+      style: {
+        position: 'absolute', top: '32px', left: '0', zIndex: '50', minWidth: '240px',
+        background: '#14161a', border: '1px solid #2a2d33', borderRadius: '4px', padding: '4px',
+        boxShadow: '0 8px 24px #00000066',
+      },
+    });
+    if (state.jiraDetailTransitionsLoading) {
+      menu.appendChild(mk('div', { style: { fontSize: '11.5px', color: '#5e6670', padding: '8px 10px' } }, ['Loading…']));
+    } else if (state.jiraDetailTransitions.length === 0) {
+      menu.appendChild(mk('div', { style: { fontSize: '11.5px', color: '#5e6670', padding: '8px 10px' } }, ['No transitions available from this status.']));
+    } else {
+      state.jiraDetailTransitions.forEach((tr) => {
+        menu.appendChild(mk('div', {
+          style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 10px', fontSize: '12px', color: '#dfe3e7', cursor: 'pointer', borderRadius: '3px' },
+          onclick: () => applyTransitionFromDetail(tr),
+        }, [
+          tr.name,
+          mk('span', { style: { fontSize: '10px', color: '#5b9bd5', fontWeight: '700' } }, ['→ ' + ((tr.to && tr.to.name) || '')]),
+        ]));
+      });
+    }
+    pillRow.appendChild(menu);
+  }
+  wrap.appendChild(pillRow);
+
+  // ── Fila de metadatos — solo los campos que de verdad tienen valor ──
+  const metaRow = mk('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 16px', fontSize: '11.5px', color: '#5e6670', marginBottom: '16px', lineHeight: '1.7' } });
+  const addMeta = (label, value) => { if (value) metaRow.appendChild(mk('span', {}, [`${label}: `, mk('span', { style: { color: '#9aa0a6' } }, [value])])); };
+  addMeta('Assignee', (f.assignee && f.assignee.displayName) || t('jira_unassigned'));
+  addMeta('Reporter', f.reporter && f.reporter.displayName);
+  const assignmentGroup = f[JIRA_CUSTOM_FIELDS.assignmentGroup];
+  addMeta('Group', assignmentGroup && (typeof assignmentGroup === 'string' ? assignmentGroup : assignmentGroup.name));
+  addMeta('Component(s)', (f.components && f.components.length) ? f.components.map((c) => c.name).join(', ') : null);
+  addMeta('Labels', (f.labels && f.labels.length) ? f.labels.join(', ') : null);
+  addMeta('Created', f.created ? new Date(f.created).toLocaleDateString() : null);
+  addMeta('Updated', f.updated ? new Date(f.updated).toLocaleDateString() : null);
+  if (f.watches && f.watches.watchCount) addMeta('Watchers', String(f.watches.watchCount));
+  wrap.appendChild(metaRow);
 
   // ── SLA ──
   const slaResolution = formatJiraSla(f[JIRA_CUSTOM_FIELDS.slaTimeToResolution]);
@@ -2797,35 +3482,44 @@ function renderJiraDetailView() {
     wrap.appendChild(descBox);
   }
 
-  // ── Business Justification — colapsable, suele traer texto largo
-  // (listas de servidores, contexto extenso) que no debería invadir la
-  // pantalla de entrada al detalle.
-  const businessJustification = f[JIRA_CUSTOM_FIELDS.businessJustification];
-  if (businessJustification) {
-    const expanded = !!state.jiraDetailExpandedFields.businessJustification;
-    const section = mk('div', { style: { marginBottom: '20px' } });
-    section.appendChild(mk('div', {
-      style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: '700', color: '#dfe3e7', cursor: 'pointer', padding: '8px 0' },
-      onclick: () => { state.jiraDetailExpandedFields.businessJustification = !expanded; renderApp(); },
-    }, [
-      mk('span', { style: { fontSize: '10px', color: '#5e6670' } }, [expanded ? '▾' : '▸']),
-      'Business Justification',
-    ]));
-    if (expanded) {
-      const bjBox = mk('div', {
-        style: { fontSize: '13px', color: '#dfe3e7', lineHeight: '1.6', background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '16px' },
-      });
-      if (typeof businessJustification === 'string') bjBox.innerHTML = jiraWikiToHtml(businessJustification);
-      else bjBox.textContent = String(businessJustification);
-      section.appendChild(bjBox);
-    }
-    wrap.appendChild(section);
+  // ── Campos personalizados — genérico, no hardcodeado. Tu Jira tiene
+  // 800+ custom fields y cada tipo de ticket usa un subconjunto distinto;
+  // en vez de mapearlos uno a uno a mano (como hacíamos antes solo con
+  // Business Justification), se detectan automáticamente los que parecen
+  // texto legible y se descartan los que parecen metadatos internos de
+  // workflow (JSON serializado, checklists, blobs de integración).
+  const customFields = extractReadableCustomFields(f, issue.names || {}).filter((cf) => cf.key !== JIRA_CUSTOM_FIELDS.assignmentGroup);
+  if (customFields.length > 0) {
+    customFields.forEach(({ key, label, value }) => {
+      const expanded = !!state.jiraDetailExpandedFields[key];
+      const isLong = value.length > 140 || value.includes('\n');
+      const section = mk('div', { style: { marginBottom: isLong ? '6px' : '10px' } });
+      if (isLong) {
+        section.appendChild(mk('div', {
+          style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: '700', color: '#dfe3e7', cursor: 'pointer', padding: '8px 0' },
+          onclick: () => { state.jiraDetailExpandedFields[key] = !expanded; renderApp(); },
+        }, [
+          mk('span', { style: { fontSize: '10px', color: '#5e6670' } }, [expanded ? '▾' : '▸']),
+          label,
+        ]));
+        if (expanded) {
+          const box = mk('div', {
+            style: { fontSize: '13px', color: '#dfe3e7', lineHeight: '1.6', background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '16px', whiteSpace: 'pre-wrap' },
+          }, [value]);
+          section.appendChild(box);
+        }
+      } else {
+        section.appendChild(mk('div', { style: { fontSize: '12px', color: '#5e6670' } }, [
+          label, ': ', mk('span', { style: { color: '#9aa0a6' } }, [value]),
+        ]));
+      }
+      wrap.appendChild(section);
+    });
   }
 
-  // ── Adjuntos existentes — imágenes y cualquier otro formato, con botón
-  // de descarga propio (la API de Jira para adjuntos requiere las mismas
-  // credenciales que el resto, así que no se puede abrir la URL directa
-  // en el navegador sin pasar primero por nuestro propio backend).
+  // ── Adjuntos existentes — miniatura real para imágenes (cargada bajo
+  // demanda desde el endpoint de thumbnail propio de Jira), fila con icono
+  // para cualquier otro formato.
   const attachments = f.attachment || [];
   if (attachments.length > 0) {
     wrap.appendChild(mk('div', { style: { fontSize: '11px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, [
@@ -2835,6 +3529,29 @@ function renderJiraDetailView() {
     attachments.forEach((att) => {
       const isImage = (att.mimeType || '').startsWith('image/');
       const sizeKb = att.size ? `${(att.size / 1024).toFixed(0)} KB` : '';
+
+      if (isImage) {
+        const cachedThumb = state.jiraDetailThumbnails[att.id];
+        if (!cachedThumb) loadAttachmentThumbnail(att); // dispara la carga; el render se repetirá cuando llegue
+        const thumbBox = mk('div', {
+          style: {
+            width: '88px', height: '88px', borderRadius: '4px', border: '1px solid #22252a', background: '#0d0e10',
+            cursor: 'pointer', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative',
+          },
+          title: att.filename,
+          onclick: () => downloadJiraAttachment(att),
+        });
+        if (cachedThumb) {
+          const img = mk('img', { style: { width: '100%', height: '100%', objectFit: 'cover' } });
+          img.src = cachedThumb;
+          thumbBox.appendChild(img);
+        } else {
+          thumbBox.appendChild(mk('span', { style: { fontSize: '10px', color: '#5e6670' } }, ['…']));
+        }
+        attachGrid.appendChild(thumbBox);
+        return;
+      }
+
       const row = mk('div', {
         style: {
           display: 'flex', alignItems: 'center', gap: '8px', background: '#0d0e10', border: '1px solid #22252a',
@@ -2842,7 +3559,7 @@ function renderJiraDetailView() {
         },
         onclick: () => downloadJiraAttachment(att),
       }, [
-        mk('span', { style: { fontSize: '14px', color: isImage ? '#5b9bd5' : '#5e6670', flexShrink: '0' } }, [isImage ? '▣' : '▤']),
+        mk('span', { style: { fontSize: '14px', color: '#5e6670', flexShrink: '0' } }, ['▤']),
         mk('div', { style: { minWidth: '0', flex: '1' } }, [
           mk('div', { style: { fontSize: '11.5px', color: '#dfe3e7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, [att.filename]),
           mk('div', { style: { fontSize: '10px', color: '#5e6670' } }, [sizeKb]),
@@ -2852,6 +3569,58 @@ function renderJiraDetailView() {
       attachGrid.appendChild(row);
     });
     wrap.appendChild(attachGrid);
+  }
+
+  // ── Sub-Tasks — cada una con su propio estado, clicable para navegar ──
+  const subtasks = f.subtasks || [];
+  if (subtasks.length > 0) {
+    wrap.appendChild(mk('div', { style: { fontSize: '11px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, [
+      `Sub-Tasks (${subtasks.length})`,
+    ]));
+    subtasks.forEach((sub) => {
+      const subFields = sub.fields || {};
+      const subColor = jiraStatusPillColor(subFields.status);
+      wrap.appendChild(mk('div', {
+        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '8px 12px', marginBottom: '6px', cursor: 'pointer' },
+        onclick: () => navigateToRelatedTicket(sub.key),
+      }, [
+        mk('div', { style: { fontSize: '12px', color: '#dfe3e7' } }, [
+          mk('span', { style: { color: '#6b8fc9', fontWeight: '700' } }, [sub.key]), '  ', subFields.summary || '',
+        ]),
+        mk('span', { style: { fontSize: '10.5px', fontWeight: '700', color: subColor, background: `${subColor}1a`, border: `1px solid ${subColor}`, borderRadius: '20px', padding: '2px 9px', flexShrink: '0' } }, [
+          (subFields.status && subFields.status.name) || '—',
+        ]),
+      ]));
+    });
+    wrap.appendChild(mk('div', { style: { height: '8px' } }));
+  }
+
+  // ── Issue Links — "is related to X", etc. ──
+  const issueLinks = f.issuelinks || [];
+  if (issueLinks.length > 0) {
+    wrap.appendChild(mk('div', { style: { fontSize: '11px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' } }, [
+      'Linked Issues',
+    ]));
+    issueLinks.forEach((il) => {
+      const linkedIssue = il.outwardIssue || il.inwardIssue;
+      if (!linkedIssue) return;
+      const linkDesc = il.outwardIssue ? (il.type && il.type.outward) : (il.type && il.type.inward);
+      const linkedFields = linkedIssue.fields || {};
+      const linkColor = jiraStatusPillColor(linkedFields.status);
+      wrap.appendChild(mk('div', {
+        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '8px 12px', marginBottom: '6px', cursor: 'pointer' },
+        onclick: () => navigateToRelatedTicket(linkedIssue.key),
+      }, [
+        mk('div', { style: { fontSize: '12px', color: '#dfe3e7' } }, [
+          mk('span', { style: { color: '#5e6670' } }, [(linkDesc || 'related to') + '  ']),
+          mk('span', { style: { color: '#6b8fc9', fontWeight: '700' } }, [linkedIssue.key]), '  ', linkedFields.summary || '',
+        ]),
+        linkedFields.status ? mk('span', { style: { fontSize: '10.5px', fontWeight: '700', color: linkColor, background: `${linkColor}1a`, border: `1px solid ${linkColor}`, borderRadius: '20px', padding: '2px 9px', flexShrink: '0' } }, [
+          linkedFields.status.name,
+        ]) : null,
+      ].filter(Boolean)));
+    });
+    wrap.appendChild(mk('div', { style: { height: '8px' } }));
   }
 
   // ── Vínculo con AWX, si existe ──
@@ -2878,11 +3647,46 @@ function renderJiraDetailView() {
       `Comments (${existingComments.length})`,
     ]));
     existingComments.forEach((c) => {
-      const commentCard = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '12px 14px', marginBottom: '8px' } });
-      commentCard.appendChild(mk('div', { style: { display: 'flex', justifyContent: 'space-between', marginBottom: '6px' } }, [
+      // Jira usa DOS claves de propiedad distintas para esto (confirmado
+      // contra datos reales de un ticket con 22 comentarios): la principal
+      // es sd.public.comment con internal:true/false; la otra,
+      // sd.allow.public.comment con allow:true/false, es un mecanismo
+      // legacy que Atlassian mantiene por compatibilidad con plugins
+      // antiguos y que en la práctica significa "público" cuando allow es
+      // true. Si solo miráramos sd.public.comment, un comentario marcado
+      // únicamente vía la propiedad legacy se trataría como público de
+      // todas formas (es nuestro default), pero queremos que la detección
+      // sea explícita y correcta, no correcta "por casualidad".
+      const props = c.properties || [];
+      const sdPublicComment = props.find((p) => p.key === 'sd.public.comment');
+      const sdAllowPublicComment = props.find((p) => p.key === 'sd.allow.public.comment');
+      const isInternal = sdPublicComment
+        ? sdPublicComment.value && sdPublicComment.value.internal === true
+        : sdAllowPublicComment
+        ? sdAllowPublicComment.value && sdAllowPublicComment.value.allow === false
+        : false;
+      const commentCard = mk('div', {
+        style: {
+          background: isInternal ? '#1a1508' : '#0d0e10',
+          border: `1px solid ${isInternal ? '#6b5320' : '#22252a'}`,
+          borderRadius: '4px', padding: '12px 14px', marginBottom: '8px',
+        },
+      });
+      const headerRow = mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' } });
+      const leftSide = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
         mk('span', { style: { fontSize: '12px', color: '#dfe3e7', fontWeight: '600' } }, [(c.author && c.author.displayName) || '—']),
-        mk('span', { style: { fontSize: '11px', color: '#5e6670' } }, [c.created ? new Date(c.created).toLocaleString() : '']),
-      ]));
+      ]);
+      if (isInternal) {
+        leftSide.appendChild(mk('span', {
+          style: {
+            fontSize: '9.5px', fontWeight: '700', color: '#dba458', background: '#2a2008',
+            border: '1px solid #6b5320', borderRadius: '3px', padding: '1px 6px', textTransform: 'uppercase', letterSpacing: '0.3px',
+          },
+        }, ['🔒 Internal']));
+      }
+      headerRow.appendChild(leftSide);
+      headerRow.appendChild(mk('span', { style: { fontSize: '11px', color: '#5e6670' } }, [c.created ? new Date(c.created).toLocaleString() : '']));
+      commentCard.appendChild(headerRow);
       const commentBody = mk('div', { style: { fontSize: '12.5px', color: '#dfe3e7', lineHeight: '1.6' } });
       commentBody.innerHTML = jiraWikiToHtml(c.body || '');
       commentCard.appendChild(commentBody);
@@ -2901,35 +3705,59 @@ function renderJiraDetailView() {
     },
     placeholder: t('jira_detail_comment_placeholder'),
     'data-focus-key': 'jira-comment-draft',
-    oninput: (e) => { state.jiraCommentDraft = e.target.value; },
+    oninput: (e) => { state.jiraCommentDraft = e.target.value; renderApp(); },
   });
   commentTextarea.value = state.jiraCommentDraft;
   commentBox.appendChild(commentTextarea);
+
+  // Dos botones de acción separados, igual que la interfaz nativa de
+  // Jira ("Share with customer" / "Comment internally") — no un toggle
+  // previo que cambia el color de un único botón. Cada uno llama a
+  // sendJiraComment con el flag internal correcto directamente, sin
+  // pasar por un estado intermedio que el usuario tenga que recordar
+  // marcar antes de escribir.
   const commentDisabled = state.jiraCommentSending || !state.jiraCommentDraft.trim();
-  commentBox.appendChild(mk('button', {
+  const actionsRow = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '14px' } });
+  actionsRow.appendChild(mk('button', {
     style: {
-      background: commentDisabled ? '#22252a' : '#dfe3e7', color: commentDisabled ? '#5e6670' : '#0a0b0d',
-      border: 'none', borderRadius: '3px', padding: '8px 20px', fontSize: '13px', fontWeight: '700',
+      background: commentDisabled ? '#22252a' : '#3a6ea8', color: commentDisabled ? '#5e6670' : '#ffffff',
+      border: 'none', borderRadius: '3px', padding: '8px 18px', fontSize: '13px', fontWeight: '700',
       cursor: commentDisabled ? 'not-allowed' : 'pointer',
     },
-    onclick: () => { if (!commentDisabled) sendJiraComment(); },
-  }, [state.jiraCommentSending ? t('jira_detail_comment_sending') : t('jira_detail_comment_send')]));
+    onclick: () => { if (!commentDisabled) sendJiraComment(false); },
+  }, [state.jiraCommentSending ? t('jira_detail_comment_sending') : 'Share with customer']));
+  actionsRow.appendChild(mk('span', {
+    style: { fontSize: '13px', color: commentDisabled ? '#5e6670' : '#dba458', cursor: commentDisabled ? 'not-allowed' : 'pointer', fontWeight: '600' },
+    onclick: () => { if (!commentDisabled) sendJiraComment(true); },
+  }, ['🔒 Comment internally']));
+  if (state.jiraCommentDraft.trim()) {
+    actionsRow.appendChild(mk('span', {
+      style: { fontSize: '12.5px', color: '#5e6670', cursor: 'pointer' },
+      onclick: () => { state.jiraCommentDraft = ''; renderApp(); },
+    }, ['Cancel']));
+  }
+  commentBox.appendChild(actionsRow);
   wrap.appendChild(commentBox);
 
-  // ── Adjuntar reporte ──
+  // ── Adjuntar manualmente — el flujo automático (adjuntar el log del job
+  // tras éxito/fallo) ya vive en las Automation Templates: cuando una
+  // plantilla lo requiere, se encola en la cola de pendientes y se resuelve
+  // desde el modal accesible por el badge del sidebar, sin necesitar un
+  // botón aparte aquí. Este botón es solo para adjuntar algo a mano, fuera
+  // de cualquier automatización.
   const attachBox = mk('div', { style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '18px' } });
-  const attachDisabled = state.jiraAttachSending || !state.awxStdout;
+  attachBox.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670', marginBottom: '10px' } }, ['Attach a file to this ticket']));
+
+  const manualDisabled = state.jiraManualAttachSending;
   attachBox.appendChild(mk('button', {
     style: {
-      background: 'transparent', color: attachDisabled ? '#5e6670' : '#dfe3e7',
-      border: `1px solid ${attachDisabled ? '#22252a' : '#5e6670'}`, borderRadius: '3px', padding: '8px 20px',
-      fontSize: '13px', fontWeight: '600', cursor: attachDisabled ? 'not-allowed' : 'pointer',
+      background: manualDisabled ? 'transparent' : '#dfe3e7', color: manualDisabled ? '#5e6670' : '#0a0b0d',
+      border: `1px solid ${manualDisabled ? '#22252a' : '#dfe3e7'}`, borderRadius: '3px', padding: '8px 20px',
+      fontSize: '13px', fontWeight: '700', cursor: manualDisabled ? 'not-allowed' : 'pointer',
     },
-    onclick: () => { if (!attachDisabled) attachJobOutputToJira(); },
-  }, [state.jiraAttachSending ? t('jira_detail_attach_sending') : '⊕ ' + t('jira_detail_attach_button')]));
-  if (!state.awxStdout) {
-    attachBox.appendChild(mk('p', { style: { fontSize: '11px', color: '#5e6670', marginTop: '8px' } }, [t('jira_detail_no_job_yet')]));
-  }
+    onclick: () => { if (!manualDisabled) attachManualFileToJira(); },
+  }, [manualDisabled ? 'Uploading…' : '⊕ Choose a file…']));
+
   wrap.appendChild(attachBox);
 
   return wrap;
@@ -4163,7 +4991,7 @@ function renderRemoteFileEditorModal() {
       color: '#dfe3e7', fontSize: '12.5px', fontFamily: "'IBM Plex Mono', monospace", resize: 'none',
     },
     'data-focus-key': 'remote-file-editor',
-    oninput: (e) => { ef.content = e.target.value; ef.dirty = true; },
+    oninput: (e) => { ef.content = e.target.value; ef.dirty = true; renderApp(); },
   });
   editorTextarea.value = ef.content;
   box.appendChild(editorTextarea);
@@ -4768,4 +5596,499 @@ function renderVsGitPanel() {
   }, ['Commit']));
 
   return panel;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Ticket Automation Templates — vincula un template de AWX a reglas de
+//  comentario/transición/adjunto en Jira, separadas para éxito y fallo.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const AUTOMATION_VARS = [
+  { key: 'job_name', label: 'Job name', desc: 'Name of the AWX job template that ran', example: 'JBT_AWX_VM_SNAPSHOT_DELETION' },
+  { key: 'job_id', label: 'Job ID', desc: 'AWX job run number', example: '4821' },
+  { key: 'status', label: 'Status', desc: 'How the job finished', example: 'successful' },
+  { key: 'finished_at', label: 'Finished at', desc: 'Date/time the job completed', example: '6/29/2026, 3:42:10 PM' },
+  { key: 'duration', label: 'Duration', desc: 'How long the job took to run', example: '38s' },
+  { key: 'requested_by', label: 'Requested by', desc: 'AWX user who launched the job', example: 'nelson.perez' },
+];
+
+async function loadAutomationTemplates() {
+  const res = await window.corexAPI.automationList();
+  if (res.ok) state.automationTemplates = res.templates;
+}
+
+async function loadPendingAttachments() {
+  const res = await window.corexAPI.automationListPendingAttachments();
+  if (res.ok) state.pendingAttachments = res.pending;
+}
+
+function emptyAutomationBranch() {
+  return {
+    enabled: false,
+    commentTemplate: '',
+    requireAttachment: false,
+    // Nombre del estado destino (ej. "Done"), NO un ID de transición fijo —
+    // las transiciones de Jira dependen del estado ACTUAL de cada ticket
+    // concreto, así que no existe un ID válido "de antemano" para una
+    // plantilla genérica. En el momento real de la automatización, COREX
+    // consulta las transiciones disponibles de ESE ticket y busca cuál
+    // lleva a un estado con este nombre.
+    transitionStatusName: '',
+    parentBehavior: 'none', // 'none' | 'comment_only' | 'comment_and_transition'
+    parentCommentTemplate: '',
+    parentRequireAttachment: false,
+    parentTransitionStatusName: '',
+  };
+}
+
+function newAutomationForm() {
+  return {
+    id: null,
+    name: '',
+    awxTemplateId: '',
+    onSuccess: emptyAutomationBranch(),
+    onFailure: emptyAutomationBranch(),
+  };
+}
+
+function openNewAutomationForm() {
+  state.automationEditingId = 'new';
+  state.automationForm = newAutomationForm();
+  renderApp();
+}
+
+function editAutomationTemplate(tpl) {
+  state.automationEditingId = tpl.id;
+  // Clonado profundo simple — evitamos mutar el objeto ya guardado mientras
+  // se edita, por si el usuario cancela sin guardar.
+  state.automationForm = JSON.parse(JSON.stringify(tpl));
+  state.automationForm.onSuccess = { ...emptyAutomationBranch(), ...state.automationForm.onSuccess };
+  state.automationForm.onFailure = { ...emptyAutomationBranch(), ...state.automationForm.onFailure };
+  renderApp();
+}
+
+function closeAutomationForm() {
+  state.automationEditingId = null;
+  state.automationForm = null;
+  state.automationVarPickerOpenFor = null;
+  renderApp();
+}
+
+async function saveAutomationTemplate() {
+  const form = state.automationForm;
+  if (!form.name.trim() || !form.awxTemplateId) {
+    toast('Name and AWX template are required', 'err');
+    return;
+  }
+  const res = await window.corexAPI.automationSave(form);
+  if (!res.ok) {
+    toast(`Could not save: ${res.error}`, 'err');
+    return;
+  }
+  toast('Automation template saved', 'ok');
+  await loadAutomationTemplates();
+  closeAutomationForm();
+}
+
+async function deleteAutomationTemplate(id) {
+  await window.corexAPI.automationDelete(id);
+  await loadAutomationTemplates();
+  renderApp();
+}
+
+// Inserta una variable en la posición del cursor del textarea correspondiente
+// — igual que un constructor de survey, no hace falta memorizar sintaxis.
+function insertAutomationVar(branchKey, varKey) {
+  const textareaId = `automation-textarea-${branchKey}`;
+  const ta = document.getElementById(textareaId);
+  const placeholder = `{{${varKey}}}`;
+  let form = state.automationForm;
+  const isParent = branchKey.startsWith('parent');
+  const branch = branchKey === 'success' ? form.onSuccess
+    : branchKey === 'failure' ? form.onFailure
+    : branchKey === 'parentSuccess' ? form.onSuccess
+    : form.onFailure;
+  const field = isParent ? 'parentCommentTemplate' : 'commentTemplate';
+
+  if (ta) {
+    const start = ta.selectionStart || 0;
+    const end = ta.selectionEnd || 0;
+    const current = branch[field] || '';
+    branch[field] = current.slice(0, start) + placeholder + current.slice(end);
+    renderApp();
+    requestAnimationFrame(() => {
+      const newTa = document.getElementById(textareaId);
+      if (newTa) {
+        const pos = start + placeholder.length;
+        newTa.focus();
+        newTa.setSelectionRange(pos, pos);
+      }
+    });
+  } else {
+    branch[field] = (branch[field] || '') + placeholder;
+    renderApp();
+  }
+}
+
+// ── Render: lista de Automation Templates ────────────────────────────────
+function renderTemplatesView() {
+  const wrap = mk('div', { style: { maxWidth: '760px' } });
+  wrap.appendChild(mk('h1', { style: { fontSize: '22px', fontWeight: '700', marginBottom: '4px', color: '#dfe3e7' } }, ['Templates']));
+  wrap.appendChild(mk('p', { style: { fontSize: '13px', color: '#5e6670', marginBottom: '20px' } }, [
+    'Link an AWX job template to automated Jira actions: comment, attach a report, and transition the ticket — separately for success and failure.',
+  ]));
+
+  if (state.pendingAttachments.length > 0) {
+    wrap.appendChild(mk('div', {
+      style: {
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#1a1508',
+        border: '1px solid #6b5320', borderRadius: '4px', padding: '10px 14px', marginBottom: '16px', cursor: 'pointer',
+      },
+      onclick: () => { state.showPendingAttachmentsModal = true; renderApp(); },
+    }, [
+      mk('span', { style: { fontSize: '12.5px', color: '#dba458' } }, [`${state.pendingAttachments.length} attachment(s) waiting to be uploaded`]),
+      mk('span', { style: { fontSize: '11.5px', color: '#dba458', fontWeight: '700' } }, ['Review →']),
+    ]));
+  }
+
+  if (state.automationEditingId) {
+    wrap.appendChild(renderAutomationEditor());
+    return wrap;
+  }
+
+  const headerRow = mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' } });
+  headerRow.appendChild(mk('span', { style: { fontSize: '11px', fontWeight: '700', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px' } }, [
+    `${state.automationTemplates.length} automation template(s)`,
+  ]));
+  headerRow.appendChild(mk('button', {
+    style: { background: '#dfe3e7', color: '#0a0b0d', border: 'none', borderRadius: '3px', padding: '7px 16px', fontSize: '12px', fontWeight: '700', cursor: 'pointer' },
+    onclick: () => openNewAutomationForm(),
+  }, ['+ New template']));
+  wrap.appendChild(headerRow);
+
+  if (state.automationTemplates.length === 0) {
+    wrap.appendChild(mk('div', { style: { fontSize: '13px', color: '#5e6670' } }, ['No automation templates yet.']));
+    return wrap;
+  }
+
+  state.automationTemplates.forEach((tpl) => {
+    const awxTpl = state.awxTemplates.find((t) => t.id === tpl.awxTemplateId);
+    const card = mk('div', {
+      style: { background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '14px 16px', marginBottom: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+    });
+    const leftCol = mk('div', { style: { cursor: 'pointer' }, onclick: () => editAutomationTemplate(tpl) }, [
+      mk('div', { style: { fontSize: '13px', fontWeight: '700', color: '#dfe3e7' } }, [tpl.name]),
+      mk('div', { style: { fontSize: '11px', color: '#5e6670' } }, [
+        `AWX template: ${awxTpl ? awxTpl.name : tpl.awxTemplateId}`,
+      ]),
+      mk('div', { style: { fontSize: '10.5px', color: '#5e6670', marginTop: '2px' } }, [
+        `Success: ${tpl.onSuccess && tpl.onSuccess.enabled ? 'on' : 'off'} · Failure: ${tpl.onFailure && tpl.onFailure.enabled ? 'on' : 'off'}`,
+      ]),
+    ]);
+    const actionsCol = mk('div', { style: { display: 'flex', gap: '8px' } }, [
+      mk('span', { style: { fontSize: '11px', color: '#5e6670', cursor: 'pointer' }, onclick: () => editAutomationTemplate(tpl) }, ['edit']),
+      mk('span', { style: { fontSize: '11px', color: '#5e6670', cursor: 'pointer' }, onclick: () => deleteAutomationTemplate(tpl.id) }, ['delete']),
+    ]);
+    card.appendChild(leftCol);
+    card.appendChild(actionsCol);
+    wrap.appendChild(card);
+  });
+
+  return wrap;
+}
+
+// ── Render: constructor de variables (estilo survey) ─────────────────────
+function renderVarPicker(branchKey) {
+  const wrap = mk('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '6px', marginBottom: '6px' } });
+  AUTOMATION_VARS.forEach((v) => {
+    wrap.appendChild(mk('span', {
+      style: { fontSize: '10.5px', color: '#5b9bd5', border: '1px solid #1d3a5a', background: '#0d1620', borderRadius: '3px', padding: '3px 8px', cursor: 'pointer' },
+      title: `${v.desc} — e.g. "${v.example}"`,
+      onclick: () => insertAutomationVar(branchKey, v.key),
+    }, [`+ ${v.label}`]));
+  });
+  return wrap;
+}
+
+// Vista previa en vivo del mensaje ya resuelto, con datos de ejemplo — para
+// que el usuario vea el resultado real sin tener que imaginar qué hace cada
+// variable o memorizar la sintaxis {{...}}.
+function renderTemplatePreview(template) {
+  if (!template || !template.trim()) return null;
+  const exampleVars = {};
+  AUTOMATION_VARS.forEach((v) => { exampleVars[v.key] = v.example; });
+  const rendered = renderAutomationTemplate(template, exampleVars);
+  return mk('div', { style: { marginBottom: '10px' } }, [
+    mk('div', { style: { fontSize: '9.5px', color: '#5e6670', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' } }, ['Preview with example data']),
+    mk('div', { style: { fontSize: '12px', color: '#9aa0a6', background: '#0a0b0d', border: '1px dashed #22252a', borderRadius: '3px', padding: '8px 10px', whiteSpace: 'pre-wrap' } }, [rendered]),
+  ]);
+}
+
+function automationTextarea(branchKey, value, onInput) {
+  const ta = mk('textarea', {
+    id: `automation-textarea-${branchKey}`,
+    style: {
+      width: '100%', minHeight: '90px', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px',
+      padding: '8px 10px', color: '#dfe3e7', fontSize: '12.5px', fontFamily: 'inherit', resize: 'vertical',
+    },
+    placeholder: 'e.g. Job {{job_name}} finished with status {{status}} at {{finished_at}}.',
+    'data-focus-key': `automation-${branchKey}`,
+    oninput: onInput,
+  });
+  ta.value = value || '';
+  return ta;
+}
+
+// ── Render: una rama completa (success u failure), con su sub-sección de padre ──
+function renderAutomationBranchEditor(branchLabel, branchKey, branch, accentColor) {
+  const wrap = mk('div', { style: { background: '#0d0e10', border: `1px solid ${accentColor}33`, borderRadius: '4px', padding: '16px', marginBottom: '16px' } });
+
+  const headerRow = mk('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' } });
+  headerRow.appendChild(renderCheckbox(branch.enabled, (e) => { branch.enabled = e.target.checked; renderApp(); }));
+  headerRow.appendChild(mk('span', { style: { fontSize: '13px', fontWeight: '700', color: accentColor } }, [branchLabel]));
+  wrap.appendChild(headerRow);
+
+  if (!branch.enabled) return wrap;
+
+  // Comentario, con selector de variables — comportamiento de visibilidad
+  // (interno en fallo, público en éxito) se decide automáticamente al
+  // disparar la automatización, no es algo que se configure aquí.
+  wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, [
+    branchKey === 'failure' ? 'Comment (will be posted as INTERNAL — hidden from the requester)' : 'Comment (will be posted publicly)',
+  ]));
+  wrap.appendChild(automationTextarea(branchKey, branch.commentTemplate, (e) => { branch.commentTemplate = e.target.value; renderApp(); }));
+  wrap.appendChild(renderVarPicker(branchKey));
+  const previewMain = renderTemplatePreview(branch.commentTemplate);
+  if (previewMain) wrap.appendChild(previewMain);
+
+  // Transición — nombre de estado en texto simple, resuelto en tiempo real
+  // contra las transiciones REALES del ticket cuando la automatización se
+  // dispare (las transiciones dependen del estado actual de cada ticket
+  // concreto, no existen "globalmente" para guardar un ID aquí).
+  wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, ['Transition ticket to status (leave empty to skip)']));
+  wrap.appendChild(mk('input', {
+    style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '12.5px', marginBottom: '12px' },
+    type: 'text',
+    placeholder: branchKey === 'failure' ? 'e.g. Failed' : 'e.g. Done',
+    value: branch.transitionStatusName || '',
+    oninput: (e) => { branch.transitionStatusName = e.target.value; },
+  }));
+
+  // Adjunto requerido — nunca interrumpe con un modal inmediato; encola una
+  // pendiente que el usuario atiende cuando quiera, desde Templates.
+  wrap.appendChild(mk('div', { style: { marginBottom: '14px' } }, [
+    renderCheckbox(branch.requireAttachment, (e) => { branch.requireAttachment = e.target.checked; renderApp(); },
+      mk('span', { style: { fontSize: '12px', color: '#dfe3e7' } }, ['Require a file attachment (you will pick the file later, from the pending queue)'])),
+  ]));
+
+  // Comportamiento del ticket padre
+  wrap.appendChild(mk('div', { style: { borderTop: '1px solid #22252a', paddingTop: '12px', marginTop: '4px' } }, [
+    mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '6px' } }, ['Parent ticket behavior']),
+  ]));
+  // Opciones propias en vez de <select> nativo: el menú desplegable de un
+  // <select> se renderiza como overlay del sistema operativo, fuera del
+  // DOM — si renderApp() reconstruye el <select> mientras ese menú está
+  // abierto, el clic en una opción puede no llegar a ningún elemento real.
+  // Mismo tipo de problema que ya resolvimos con los checkboxes nativos.
+  const parentBehaviorWrap = mk('div', { style: { border: '1px solid #22252a', borderRadius: '3px', marginBottom: '10px', overflow: 'hidden' } });
+  [
+    { value: 'none', label: "Don't touch the parent ticket" },
+    { value: 'comment_only', label: 'Comment on the parent (no transition)' },
+    { value: 'comment_and_transition', label: 'Comment and transition the parent' },
+  ].forEach((opt, i, arr) => {
+    const active = branch.parentBehavior === opt.value;
+    parentBehaviorWrap.appendChild(mk('div', {
+      style: {
+        padding: '9px 12px', fontSize: '12.5px', cursor: 'pointer',
+        color: active ? '#dfe3e7' : '#9aa0a6',
+        background: active ? '#14161a' : 'transparent',
+        borderBottom: i < arr.length - 1 ? '1px solid #22252a' : 'none',
+        borderLeft: active ? '2px solid #6ad17e' : '2px solid transparent',
+      },
+      onclick: () => { branch.parentBehavior = opt.value; renderApp(); },
+    }, [opt.label]));
+  });
+  wrap.appendChild(parentBehaviorWrap);
+
+  if (branch.parentBehavior !== 'none') {
+    const parentKey = `parent${branchKey === 'success' ? 'Success' : 'Failure'}`;
+    wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, [
+      'Parent comment (leave empty to reuse the comment above)',
+    ]));
+    wrap.appendChild(automationTextarea(parentKey, branch.parentCommentTemplate, (e) => { branch.parentCommentTemplate = e.target.value; renderApp(); }));
+    wrap.appendChild(renderVarPicker(parentKey));
+    const previewParent = renderTemplatePreview(branch.parentCommentTemplate || branch.commentTemplate);
+    if (previewParent) wrap.appendChild(previewParent);
+
+    if (branch.parentBehavior === 'comment_and_transition') {
+      wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px', marginTop: '10px' } }, ['Transition parent ticket to status']));
+      wrap.appendChild(mk('input', {
+        style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '12.5px' },
+        type: 'text',
+        placeholder: 'e.g. Done',
+        value: branch.parentTransitionStatusName || '',
+        oninput: (e) => { branch.parentTransitionStatusName = e.target.value; },
+      }));
+    }
+
+    wrap.appendChild(mk('div', { style: { marginTop: '10px' } }, [
+      renderCheckbox(branch.parentRequireAttachment, (e) => { branch.parentRequireAttachment = e.target.checked; renderApp(); },
+        mk('span', { style: { fontSize: '12px', color: '#dfe3e7' } }, ['Also require an attachment for the parent'])),
+    ]));
+  }
+
+  return wrap;
+}
+
+// ── Render: editor completo de una Automation Template ───────────────────
+function renderAutomationEditor() {
+  const form = state.automationForm;
+  const wrap = mk('div', {});
+
+  wrap.appendChild(mk('div', { style: { fontSize: '14px', fontWeight: '700', color: '#dfe3e7', marginBottom: '16px' } }, [
+    state.automationEditingId === 'new' ? 'New automation template' : 'Edit automation template',
+  ]));
+
+  wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, ['Template name']));
+  wrap.appendChild(mk('input', {
+    style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '13px', marginBottom: '12px' },
+    type: 'text',
+    placeholder: 'e.g. VM Snapshot Deletion - standard',
+    value: form.name,
+    oninput: (e) => { form.name = e.target.value; },
+  }));
+
+  wrap.appendChild(mk('label', { style: { fontSize: '10.5px', color: '#5e6670', display: 'block', marginBottom: '4px' } }, [
+    'AWX job template — any ticket that runs this AWX template inherits this automation',
+  ]));
+
+  const selectedTpl = state.awxTemplates.find((t) => String(t.id) === String(form.awxTemplateId));
+  if (selectedTpl) {
+    wrap.appendChild(mk('div', {
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0d1620', border: '1px solid #1d3a5a', borderRadius: '3px', padding: '8px 12px', marginBottom: '20px' },
+    }, [
+      mk('span', { style: { fontSize: '13px', color: '#dfe3e7', fontWeight: '600' } }, [selectedTpl.name]),
+      mk('span', {
+        style: { fontSize: '11px', color: '#5b9bd5', cursor: 'pointer' },
+        onclick: () => { form.awxTemplateId = ''; state.automationAwxFilter = ''; renderApp(); },
+      }, ['change']),
+    ]));
+  } else {
+    wrap.appendChild(mk('input', {
+      style: { width: '100%', background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '8px 10px', color: '#dfe3e7', fontSize: '13px', marginBottom: '8px' },
+      type: 'text',
+      placeholder: 'Search AWX templates by name…',
+      value: state.automationAwxFilter,
+      'data-focus-key': 'automation-awx-search',
+      oninput: (e) => { state.automationAwxFilter = e.target.value; renderApp(); },
+    }));
+
+    const filterText = state.automationAwxFilter.trim().toLowerCase();
+    const matches = (filterText
+      ? state.awxTemplates.filter((t) => (t.name || '').toLowerCase().includes(filterText))
+      : state.awxTemplates
+    ).slice(0, 8);
+
+    const resultsBox = mk('div', { style: { border: matches.length ? '1px solid #22252a' : 'none', borderRadius: '3px', marginBottom: '20px', maxHeight: '220px', overflowY: 'auto' } });
+    matches.forEach((tpl) => {
+      resultsBox.appendChild(mk('div', {
+        style: { padding: '8px 12px', fontSize: '12.5px', color: '#dfe3e7', cursor: 'pointer', borderBottom: '1px solid #14161a' },
+        onclick: () => { form.awxTemplateId = String(tpl.id); state.automationAwxFilter = ''; renderApp(); },
+      }, [tpl.name]));
+    });
+    wrap.appendChild(resultsBox);
+    if (filterText && matches.length === 0) {
+      wrap.appendChild(mk('div', { style: { fontSize: '11.5px', color: '#5e6670', marginTop: '-14px', marginBottom: '20px' } }, ['No templates match.']));
+    }
+  }
+
+  if (state.awxTemplates.length === 0) {
+    wrap.appendChild(mk('div', { style: { fontSize: '11px', color: '#c98a3a', marginTop: '-14px', marginBottom: '16px' } }, [
+      'No AWX templates loaded yet — visit the AWX view once so they load, then come back here.',
+    ]));
+  }
+
+  wrap.appendChild(renderAutomationBranchEditor('On success', 'success', form.onSuccess, '#6ad17e'));
+  wrap.appendChild(renderAutomationBranchEditor('On failure', 'failure', form.onFailure, '#c94f4f'));
+
+  const btnRow = mk('div', { style: { display: 'flex', gap: '8px', marginTop: '8px' } });
+  btnRow.appendChild(mk('button', {
+    style: { background: '#dfe3e7', color: '#0a0b0d', border: 'none', borderRadius: '3px', padding: '9px 20px', fontSize: '12.5px', fontWeight: '700', cursor: 'pointer' },
+    onclick: () => saveAutomationTemplate(),
+  }, ['Save']));
+  btnRow.appendChild(mk('span', { style: { fontSize: '12px', color: '#5e6670', cursor: 'pointer', alignSelf: 'center' }, onclick: () => closeAutomationForm() }, ['Cancel']));
+  wrap.appendChild(btnRow);
+
+  return wrap;
+}
+
+// ── Render: modal de adjuntos pendientes ──────────────────────────────────
+function renderPendingAttachmentsModal() {
+  const overlay = mk('div', {
+    style: {
+      position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
+      background: '#000000aa', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: '999',
+    },
+    onclick: (e) => { if (e.target === e.currentTarget) { state.showPendingAttachmentsModal = false; renderApp(); } },
+  });
+
+  const box = mk('div', { style: { width: '480px', maxHeight: '70%', overflowY: 'auto', background: '#0d0e10', border: '1px solid #22252a', borderRadius: '4px', padding: '20px' } });
+  const headerRow = mk('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' } });
+  headerRow.appendChild(mk('div', { style: { fontSize: '13px', fontWeight: '700', color: '#dfe3e7' } }, ['Pending attachments']));
+  headerRow.appendChild(mk('span', { style: { fontSize: '12px', color: '#5e6670', cursor: 'pointer' }, onclick: () => { state.showPendingAttachmentsModal = false; renderApp(); } }, ['Close']));
+  box.appendChild(headerRow);
+
+  if (state.pendingAttachments.length === 0) {
+    box.appendChild(mk('div', { style: { fontSize: '12.5px', color: '#5e6670' } }, ['Nothing pending.']));
+  } else {
+    state.pendingAttachments.forEach((p) => {
+      const row = mk('div', { style: { background: '#0a0b0d', border: '1px solid #22252a', borderRadius: '3px', padding: '12px', marginBottom: '8px' } });
+      row.appendChild(mk('div', { style: { fontSize: '12.5px', color: '#dfe3e7', fontWeight: '600' } }, [
+        `${p.ticketKey}${p.isParent ? ' (parent)' : ''}`,
+      ]));
+      row.appendChild(mk('div', { style: { fontSize: '11px', color: '#5e6670', marginBottom: '8px' } }, [
+        `${p.jobName} · ${p.status}`,
+      ]));
+      const btnRow = mk('div', { style: { display: 'flex', gap: '8px' } });
+      const isResolving = state.resolvingPendingAttachmentId === p.id;
+      btnRow.appendChild(mk('button', {
+        style: { background: '#dfe3e7', color: '#0a0b0d', border: 'none', borderRadius: '3px', padding: '6px 14px', fontSize: '11.5px', fontWeight: '700', cursor: isResolving ? 'not-allowed' : 'pointer' },
+        onclick: () => { if (!isResolving) resolvePendingAttachment(p); },
+      }, [isResolving ? 'Uploading…' : 'Choose file…']));
+      btnRow.appendChild(mk('span', { style: { fontSize: '11px', color: '#5e6670', cursor: 'pointer', alignSelf: 'center' }, onclick: () => dismissPendingAttachment(p.id) }, ['dismiss']));
+      row.appendChild(btnRow);
+      box.appendChild(row);
+    });
+  }
+
+  overlay.appendChild(box);
+  return overlay;
+}
+
+async function resolvePendingAttachment(pending) {
+  state.resolvingPendingAttachmentId = pending.id;
+  renderApp();
+  const res = await window.corexAPI.automationPickAndUploadAttachment(pending.ticketKey);
+  state.resolvingPendingAttachmentId = null;
+  if (res.canceled) {
+    renderApp();
+    return;
+  }
+  if (!res.ok) {
+    toast(`Upload failed: ${res.error}`, 'err');
+    renderApp();
+    return;
+  }
+  await window.corexAPI.automationResolvePendingAttachment(pending.id);
+  await loadPendingAttachments();
+  state.persistentBanners = state.persistentBanners.filter((b) => b.id !== pending.id);
+  toast(`Attached ${res.filename} to ${pending.ticketKey}`, 'ok');
+  renderApp();
+}
+
+async function dismissPendingAttachment(id) {
+  await window.corexAPI.automationResolvePendingAttachment(id);
+  await loadPendingAttachments();
+  state.persistentBanners = state.persistentBanners.filter((b) => b.id !== id);
+  renderApp();
 }

@@ -26,11 +26,23 @@ contextBridge.exposeInMainWorld('corexAPI', {
   // Jira
   jiraGetIssue: (key) => ipcRenderer.invoke('jira:getIssue', { key }),
   jiraSearchMyIssues: () => ipcRenderer.invoke('jira:searchMyIssues'),
-  jiraAddComment: (key, body) => ipcRenderer.invoke('jira:addComment', { key, body }),
+  jiraAddComment: (key, body, internal) => ipcRenderer.invoke('jira:addComment', { key, body, internal }),
   jiraAddAttachment: (key, filename, contentBase64) =>
     ipcRenderer.invoke('jira:addAttachment', { key, filename, contentBase64 }),
   jiraDownloadAttachment: (url, suggestedName) =>
     ipcRenderer.invoke('jira:downloadAttachment', { url, suggestedName }),
+  jiraFetchThumbnail: (url, mimeType) => ipcRenderer.invoke('jira:fetchThumbnail', { url, mimeType }),
+  jiraListTransitions: (key) => ipcRenderer.invoke('jira:listTransitions', { key }),
+  jiraDoTransition: (key, transitionId) => ipcRenderer.invoke('jira:doTransition', { key, transitionId }),
+
+  // Ticket Automation Templates
+  automationList: () => ipcRenderer.invoke('automation:list'),
+  automationSave: (template) => ipcRenderer.invoke('automation:save', { template }),
+  automationDelete: (id) => ipcRenderer.invoke('automation:delete', { id }),
+  automationListPendingAttachments: () => ipcRenderer.invoke('automation:listPendingAttachments'),
+  automationAddPendingAttachment: (pending) => ipcRenderer.invoke('automation:addPendingAttachment', { pending }),
+  automationResolvePendingAttachment: (id) => ipcRenderer.invoke('automation:resolvePendingAttachment', { id }),
+  automationPickAndUploadAttachment: (ticketKey) => ipcRenderer.invoke('automation:pickAndUploadAttachment', { ticketKey }),
 
   // Vínculos ticket ↔ template
   ticketLinksGet: () => ipcRenderer.invoke('ticketLinks:get'),
