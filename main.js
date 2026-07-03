@@ -1,45 +1,12 @@
 const { app, BrowserWindow, ipcMain, dialog, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const https = require('https');
 const http = require('http');
 const si = require('systeminformation');
 const crypto = require('crypto');
 const { Client: SSHClient } = require('ssh2');
 const simpleGit = require('simple-git');
-// Windows + OneDrive/corporate profiles can leave Electron's default GPU/cache
-// directory unwritable, which shows as Chromium cache errors followed by a
-// black window. Put Chromium session/cache data in an explicit local writable
-// directory before Chromium starts, without touching COREX's encrypted vault.
-function configureChromiumCachePaths() {
-  const base = process.platform === 'win32'
-    ? (process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'))
-    : app.getPath('userData');
-  const sessionDataPath = path.join(base, 'COREX', 'ElectronSession');
-  const diskCachePath = path.join(sessionDataPath, 'Cache');
-
-  try {
-    fs.mkdirSync(diskCachePath, { recursive: true });
-    app.setPath('sessionData', sessionDataPath);
-    app.commandLine.appendSwitch('disk-cache-dir', diskCachePath);
-    app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
-  } catch (e) {
-    const fallbackSession = path.join(os.tmpdir(), 'corex-electron-session');
-    const fallbackCache = path.join(fallbackSession, 'Cache');
-    try {
-      fs.mkdirSync(fallbackCache, { recursive: true });
-      app.setPath('sessionData', fallbackSession);
-      app.commandLine.appendSwitch('disk-cache-dir', fallbackCache);
-      app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
-      console.warn('[COREX] Using temporary Electron cache directory:', fallbackSession, e.message);
-    } catch (fallbackErr) {
-      console.warn('[COREX] Could not configure Electron cache directory:', fallbackErr.message);
-    }
-  }
-}
-configureChromiumCachePaths();
-
 let pty;
 try {
   pty = require('node-pty');
@@ -48,6 +15,95 @@ try {
   // CorexTerm degrada con un mensaje claro en vez de petar toda la app.
   pty = null;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Logs persistentes a disco — sistema de logging rotado
+// ═══════════════════════════════════════════════════════════════════════════
+// Electron expone app.getPath('logs') — la ruta estándar que cada SO
+// asigna a logs de aplicaciones:
+//   Mac:     ~/Library/Logs/COREX/
+//   Windows: %APPDATA%\COREX\logs\
+//   Linux:   ~/.config/COREX/logs/
+// Sin esto, todo va a console.log y desaparece al cerrar la ventana.
+// Cuando algo falla en producción real y el usuario no estaba mirando,
+// no hay forma de saber qué pasó — estos logs lo permiten.
+//
+// Rotación: mantenemos los últimos N_LOG_FILES archivos de LOG_MAX_BYTES
+// cada uno — así los logs no crecen sin límite y ocupan como máximo
+// N_LOG_FILES × LOG_MAX_BYTES de espacio en disco.
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2 MB por archivo
+const N_LOG_FILES = 5;                  // hasta 5 archivos → máximo 10 MB total
+let logDir = null;
+let logStream = null;
+
+function initLogger() {
+  try {
+    logDir = app.getPath('logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    openLogFile();
+    // Interceptamos console.log/warn/error para que todo vaya también al
+    // archivo, sin cambiar nada de cómo el resto del código escribe mensajes
+    // — no hay que tocar los 79 handlers para que sus logs queden guardados.
+    const originalLog   = console.log.bind(console);
+    const originalWarn  = console.warn.bind(console);
+    const originalError = console.error.bind(console);
+    console.log   = (...args) => { writeLog('INFO ', args); originalLog(...args); };
+    console.warn  = (...args) => { writeLog('WARN ', args); originalWarn(...args); };
+    console.error = (...args) => { writeLog('ERROR', args); originalError(...args); };
+    console.log(`[COREX] Logger initialized → ${logDir}`);
+  } catch (e) {
+    // Si el logger falla al iniciar (permisos, disco lleno, etc.) la app
+    // sigue funcionando sin logs — un error aquí no debe tumbar COREX.
+    console.error('[COREX] Logger init failed:', e.message);
+  }
+}
+
+function openLogFile() {
+  if (logStream) { try { logStream.end(); } catch (e) {} }
+  const file = path.join(logDir, 'corex.log');
+  // Rotación: si el archivo actual ya pesa demasiado, lo renombramos a
+  // corex.1.log, desplazamos los anteriores, y empezamos uno nuevo vacío.
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size >= LOG_MAX_BYTES) rotateLogs();
+  } catch (e) { /* el archivo aún no existe, no hay nada que rotar */ }
+  logStream = fs.createWriteStream(file, { flags: 'a', encoding: 'utf-8' });
+  logStream.on('error', (e) => console.error('[COREX] Log write error:', e.message));
+}
+
+function rotateLogs() {
+  // corex.4.log → (eliminar si existe)
+  // corex.3.log → corex.4.log
+  // corex.2.log → corex.3.log
+  // corex.1.log → corex.2.log
+  // corex.log   → corex.1.log
+  for (let i = N_LOG_FILES - 1; i >= 1; i--) {
+    const from = path.join(logDir, i === 1 ? 'corex.log' : `corex.${i - 1}.log`);
+    const to   = path.join(logDir, `corex.${i}.log`);
+    try { fs.renameSync(from, to); } catch (e) {}
+  }
+}
+
+function writeLog(level, args) {
+  if (!logStream) return;
+  try {
+    const ts = new Date().toISOString();
+    const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+    const line = `${ts} [${level}] ${msg}\n`;
+    logStream.write(line);
+    // Rotación en caliente: si el archivo ya pesa demasiado mientras la
+    // app está corriendo, abrimos uno nuevo sin esperar al próximo arranque.
+    if (logStream.bytesWritten >= LOG_MAX_BYTES) openLogFile();
+  } catch (e) { /* silencio — si falla el log no rompemos la app */ }
+}
+
+// Exponemos la ruta del directorio de logs al frontend (para mostrarla en
+// Settings si el usuario necesita encontrar los archivos manualmente).
+ipcMain.handle('app:getLogDir', () => logDir || null);
+
+// initLogger() se llama en app.whenReady(), que se inicializa más abajo.
+// No se puede llamar antes porque app.getPath() requiere que Electron
+// ya haya inicializado su entorno de rutas.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Vault — almacenamiento cifrado único para AWX/Jira/SMTP/CorexTerm
@@ -203,6 +259,35 @@ function saveConfig(cfg) {
   return persistVault();
 }
 
+// Referencia global a la ventana principal — necesaria para enviar eventos
+// push desde callbacks asíncronos (SSH stream.on('data'), PTY onData) donde
+// event.sender puede no estar disponible o ser incorrecto por el momento en
+// que el callback se ejecuta (después de que el ipcMain.handle ya completó).
+let mainWin = null;
+
+// Auto-lock por eventos de energía: si el equipo se suspende o se bloquea
+// la pantalla, el vault se bloquea solo — un portátil desatendido no debe
+// quedarse con las credenciales descifradas en memoria. Se purga la clave
+// aquí mismo (main) de inmediato, por si el suspend real llega antes de que
+// el renderer procese el aviso; el renderer hace después su limpieza
+// completa (pollers, terminales, estado, volver al gate).
+function setupPowerLock() {
+  const { powerMonitor } = require('electron');
+  const fire = (reason) => {
+    vaultKeyCache = null;
+    vaultDataCache = null;
+    sendToRenderer('corex:force-lock', { reason });
+  };
+  powerMonitor.on('suspend', () => fire('suspend'));
+  powerMonitor.on('lock-screen', () => fire('lock-screen'));
+}
+
+function sendToRenderer(channel, payload) {
+  if (mainWin && !mainWin.isDestroyed()) {
+    mainWin.webContents.send(channel, payload);
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -234,16 +319,7 @@ function createWindow() {
     }
   });
 
-  // Si el renderer falla durante el rediseño visual, una ventana negra sin
-  // DevTools no dice nada. Reenviamos errores de consola al proceso main para
-  // que npm start muestre la causa real junto a los logs de Electron.
-  win.webContents.on('console-message', (event, level, message, line, sourceId) => {
-    if (level >= 2) console.error(`[COREX renderer] ${sourceId}:${line} ${message}`);
-  });
-  win.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-    console.error('[COREX] Failed to load renderer:', errorCode, errorDescription, validatedURL);
-  });
-
+  mainWin = win;
   win.loadFile(path.join(__dirname, 'src/index.html'));
 }
 
@@ -262,7 +338,11 @@ process.on('unhandledRejection', (reason) => {
   console.error('[COREX] Unhandled rejection in main process:', reason);
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  setupPowerLock();
+  initLogger();
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
@@ -534,6 +614,7 @@ ipcMain.handle('awx:getSurveySpec', async (event, { templateId }) => {
       rejectUnauthorized: awx.verifySsl !== false,
     });
     if (res.status === 404) return { ok: true, spec: null }; // sin survey configurado
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, spec: res.body };
   } catch (e) {
@@ -553,6 +634,7 @@ ipcMain.handle('awx:listInstanceGroups', async () => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
   } catch (e) {
@@ -572,6 +654,7 @@ ipcMain.handle('awx:listInventories', async () => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
   } catch (e) {
@@ -588,6 +671,7 @@ ipcMain.handle('awx:listCredentials', async () => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
   } catch (e) {
@@ -604,6 +688,7 @@ ipcMain.handle('awx:listExecutionEnvironments', async () => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, results: (res.body && res.body.results) || [] };
   } catch (e) {
@@ -651,6 +736,7 @@ ipcMain.handle('awx:getJob', async (event, { jobId }) => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, job: res.body };
   } catch (e) {
@@ -668,6 +754,7 @@ ipcMain.handle('awx:getJobStdout', async (event, { jobId }) => {
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, stdout: typeof res.body === 'string' ? res.body : JSON.stringify(res.body) };
   } catch (e) {
@@ -687,6 +774,7 @@ ipcMain.handle('awx:getTemplateJobHistory', async (event, { templateId, page }) 
       headers: awxAuthHeader(awx),
       rejectUnauthorized: awx.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return {
       ok: true,
@@ -776,12 +864,129 @@ ipcMain.handle('jira:getIssue', async (event, { key }) => {
 
 // Lista los tickets asignados al usuario actual (sin resolver, los más recientes primero).
 // Usamos JQL con currentUser() para no tener que saber/guardar tu username de Jira.
+// Identidad real del usuario en Jira — alimenta el avatar y el nombre en la
+// UI (sidebar + topbar). El avatar de Jira exige auth para descargarse, así
+// que lo bajamos aquí (backend, con las credenciales del vault) y lo
+// devolvemos como data URL listo para <img>, mismo patrón que fetchThumbnail.
+ipcMain.handle('jira:myself', async () => {
+  const { jira } = loadConfig();
+  if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
+  try {
+    const res = await httpRequestWithRetry({
+      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/myself`,
+      headers: jiraAuthHeader(jira),
+      rejectUnauthorized: jira.verifySsl !== false,
+    });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
+    const me = res.body || {};
+    let avatarDataUrl = null;
+    const avatarUrl = me.avatarUrls && (me.avatarUrls['48x48'] || me.avatarUrls['32x32']);
+    if (avatarUrl) {
+      try {
+        const img = await httpDownloadBinary({
+          url: avatarUrl,
+          headers: jiraAuthHeader(jira),
+          rejectUnauthorized: jira.verifySsl !== false,
+        });
+        if (img.status < 400 && img.buffer && img.buffer.length > 0) {
+          // Jira puede servir PNG o SVG según el tipo de avatar; detectamos
+          // por el primer byte ('<' => SVG/XML) para el MIME correcto.
+          const isSvg = img.buffer[0] === 0x3c;
+          avatarDataUrl = `data:image/${isSvg ? 'svg+xml' : 'png'};base64,${img.buffer.toString('base64')}`;
+        }
+      } catch (e) { /* sin avatar no pasa nada: la UI cae a las iniciales */ }
+    }
+    return {
+      ok: true,
+      me: {
+        displayName: me.displayName || null,
+        emailAddress: me.emailAddress || null,
+        accountId: me.accountId || me.key || null,
+        avatarDataUrl,
+      },
+    };
+  } catch (e) {
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
+  }
+});
+
+// ── SLA (Jira Service Management) ─────────────────────────────────────────
+// Los SLA de JSM no son un campo fijo: son custom fields (uno por SLA
+// definido en el proyecto: "Time to resolution", "Time to first response"…)
+// cuyo tipo de schema es 'sd-sla-field'. Se descubren una vez contra
+// /rest/api/2/field y se cachean 10 min — así COREX funciona con CUALQUIER
+// instancia de JSM sin hardcodear IDs de customfield, y si el Jira no es
+// Service Management (cero campos SLA), todo degrada limpio a "sin SLA".
+let slaFieldsCache = { ids: null, fetchedAt: 0 };
+const SLA_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function discoverSlaFieldIds(jira) {
+  const now = Date.now();
+  if (slaFieldsCache.ids !== null && (now - slaFieldsCache.fetchedAt) < SLA_CACHE_TTL_MS) {
+    return slaFieldsCache.ids;
+  }
+  try {
+    const res = await httpRequest({
+      url: `${jira.url.replace(/\/$/, '')}/rest/api/2/field`,
+      headers: jiraAuthHeader(jira),
+      rejectUnauthorized: jira.verifySsl !== false,
+    });
+    if (res.status >= 400 || !Array.isArray(res.body)) return slaFieldsCache.ids || [];
+    const ids = res.body
+      .filter((f) => f.schema && typeof f.schema.custom === 'string' && f.schema.custom.includes('sd-sla-field'))
+      .map((f) => ({ id: f.id, name: f.name }));
+    slaFieldsCache = { ids, fetchedAt: now };
+    return ids;
+  } catch (e) {
+    // Error de red en el discovery: devolvemos lo último conocido (o vacío)
+    // sin romper la búsqueda de tickets, que es lo importante.
+    return slaFieldsCache.ids || [];
+  }
+}
+
+// Resume los campos SLA de un issue en un solo objeto para el frontend:
+// el ciclo EN CURSO más urgente (menor tiempo restante) + si algo ya se
+// incumplió. El formato del valor de un campo SLA de JSM es:
+//   { ongoingCycle: { remainingTime: { millis }, breached, goalDuration... },
+//     completedCycles: [ { breached, ... } ] }
+function summarizeIssueSla(issue, slaFields) {
+  if (!slaFields.length || !issue.fields) return null;
+  let worst = null;
+  let anyBreached = false;
+  let hasAnySlaData = false;
+  for (const sf of slaFields) {
+    const val = issue.fields[sf.id];
+    if (!val) continue;
+    hasAnySlaData = true;
+    const cycle = val.ongoingCycle;
+    if (cycle && cycle.remainingTime && typeof cycle.remainingTime.millis === 'number') {
+      if (cycle.breached) anyBreached = true;
+      if (!worst || cycle.remainingTime.millis < worst.remainingMillis) {
+        worst = {
+          name: sf.name,
+          remainingMillis: cycle.remainingTime.millis,
+          breached: !!cycle.breached,
+          goalMillis: (cycle.goalDuration && cycle.goalDuration.millis) || null,
+        };
+      }
+    }
+    if (Array.isArray(val.completedCycles) && val.completedCycles.some((c) => c.breached)) {
+      anyBreached = true;
+    }
+  }
+  if (!hasAnySlaData) return null;
+  return { ongoing: worst, anyBreached };
+}
+
 ipcMain.handle('jira:searchMyIssues', async () => {
   const { jira } = loadConfig();
   if (!jira || !jira.url || !jira.token) return { ok: false, error: 'Jira no configurado' };
   try {
+    const slaFields = await discoverSlaFieldIds(jira);
     const jql = encodeURIComponent('assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC');
-    const fields = encodeURIComponent('summary,status,priority,updated,issuetype,components,parent');
+    const baseFields = ['summary', 'status', 'priority', 'updated', 'issuetype', 'components', 'parent'];
+    const fields = encodeURIComponent(baseFields.concat(slaFields.map((f) => f.id)).join(','));
     const res = await httpRequestWithRetry({
       url: `${jira.url.replace(/\/$/, '')}/rest/api/2/search?jql=${jql}&fields=${fields}&maxResults=100`,
       headers: jiraAuthHeader(jira),
@@ -789,7 +994,13 @@ ipcMain.handle('jira:searchMyIssues', async () => {
     });
     if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
-    return { ok: true, issues: (res.body && res.body.issues) || [] };
+    const issues = ((res.body && res.body.issues) || []).map((issue) => ({
+      ...issue,
+      // Resumen SLA precalculado — el renderer no necesita conocer los IDs
+      // de customfield ni el formato interno de JSM.
+      _sla: summarizeIssueSla(issue, slaFields),
+    }));
+    return { ok: true, issues, slaAvailable: slaFields.length > 0 };
   } catch (e) {
     return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
   }
@@ -875,7 +1086,7 @@ ipcMain.handle('jira:addAttachment', async (event, { key, filename, contentBase6
           let parsed = null;
           try { parsed = data ? JSON.parse(data) : null; } catch (e) { parsed = data; }
           if (res.statusCode === 401 || res.statusCode === 403) {
-            resolve({ ok: false, error: `HTTP ${res.statusCode}: sin permiso para adjuntar archivos` });
+            resolve({ ok: false, error: `HTTP ${res.statusCode}: sin permiso para adjuntar archivos`, isAuthError: true });
             return;
           }
           if (res.statusCode >= 400) {
@@ -936,6 +1147,7 @@ ipcMain.handle('jira:downloadAttachment', async (event, { url, suggestedName }) 
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     fs.writeFileSync(filePath, res.buffer);
     return { ok: true, filePath };
@@ -957,6 +1169,7 @@ ipcMain.handle('jira:fetchThumbnail', async (event, { url, mimeType }) => {
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, dataUrl: `data:${mimeType || 'image/png'};base64,${res.buffer.toString('base64')}` };
   } catch (e) {
@@ -1096,8 +1309,269 @@ ipcMain.handle('vault:unlock', async (event, { masterPassword }) => {
   return { ...res, firstTime: false };
 });
 
+// ── Credenciales personalizadas (gestor de secretos del Vault) ───────────
+// Secretos arbitrarios con nombre (passwords de equipos, tokens de APIs,
+// llaves…) guardados DENTRO del mismo blob cifrado AES-256-GCM del vault.
+// Principios: list nunca devuelve el secreto (solo metadata); el secreto
+// solo sale con creds:reveal, bajo petición explícita de la UI.
+function ensureCustomCreds() {
+  if (!Array.isArray(vaultDataCache.customCredentials)) vaultDataCache.customCredentials = [];
+  return vaultDataCache.customCredentials;
+}
+
+ipcMain.handle('creds:list', async () => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  const creds = ensureCustomCreds();
+  return {
+    ok: true,
+    credentials: creds.map((c) => ({
+      id: c.id, name: c.name, username: c.username || '', url: c.url || '',
+      notes: c.notes || '', updatedAt: c.updatedAt || null,
+      // longitud como única pista visual — jamás el secreto en un list.
+      secretLength: (c.secret || '').length,
+    })),
+  };
+});
+
+ipcMain.handle('creds:save', async (event, { id, name, username, url, secret, notes }) => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  if (!name || !name.trim()) return { ok: false, error: 'Name is required' };
+  const creds = ensureCustomCreds();
+  const now = new Date().toISOString();
+  if (id) {
+    const existing = creds.find((c) => c.id === id);
+    if (!existing) return { ok: false, error: 'Credential not found' };
+    existing.name = name.trim();
+    existing.username = username || '';
+    existing.url = url || '';
+    existing.notes = notes || '';
+    // Secreto vacío en un edit = "no cambiar el secreto actual" — permite
+    // editar metadata sin tener que reescribir la contraseña.
+    if (secret) existing.secret = secret;
+    existing.updatedAt = now;
+  } else {
+    if (!secret) return { ok: false, error: 'Secret is required' };
+    creds.push({
+      id: `cred-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      name: name.trim(), username: username || '', url: url || '',
+      secret, notes: notes || '', createdAt: now, updatedAt: now,
+    });
+  }
+  const res = persistVault();
+  if (!res.ok) return { ok: false, error: `Could not persist vault: ${res.error}` };
+  return { ok: true };
+});
+
+ipcMain.handle('creds:delete', async (event, { id }) => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  const creds = ensureCustomCreds();
+  const before = creds.length;
+  vaultDataCache.customCredentials = creds.filter((c) => c.id !== id);
+  if (vaultDataCache.customCredentials.length === before) return { ok: false, error: 'Credential not found' };
+  const res = persistVault();
+  if (!res.ok) return { ok: false, error: `Could not persist vault: ${res.error}` };
+  return { ok: true };
+});
+
+ipcMain.handle('creds:reveal', async (event, { id }) => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  const cred = ensureCustomCreds().find((c) => c.id === id);
+  if (!cred) return { ok: false, error: 'Credential not found' };
+  return { ok: true, secret: cred.secret || '' };
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Icinga2 — monitorización (fase 1: solo lectura)
+// ═══════════════════════════════════════════════════════════════════════════
+// API REST de Icinga2 (puerto 5665). Autenticación básica con API user.
+// Dos fuentes:
+//  · /v1/status/CIB — números AGREGADOS globales (hosts up/down, servicios
+//    ok/warn/crit...): O(1), sin bajar los ~10k hosts del central.
+//  · /v1/objects/{hosts,services} con filtro state!=0 — solo los problemas,
+//    con attrs mínimos, usando POST + X-HTTP-Method-Override: GET (la forma
+//    canónica de mandar filtros complejos en el body a la API de Icinga).
+// El filtro de equipo (Linux/Windows, definido en Settings y elegido en el
+// Perfil) se aplica a las consultas de problemas; los agregados del CIB son
+// globales por naturaleza (limitación documentada de fase 1).
+
+function icingaAuthHeader(icg) {
+  return { Authorization: `Basic ${Buffer.from(`${icg.username}:${icg.password}`).toString('base64')}`, Accept: 'application/json' };
+}
+
+function icingaTeamFilter(icg, team) {
+  if (team === 'linux' && icg.linuxFilter) return icg.linuxFilter;
+  if (team === 'windows' && icg.windowsFilter) return icg.windowsFilter;
+  if (team === 'both') {
+    const parts = [icg.linuxFilter, icg.windowsFilter].filter(Boolean);
+    if (parts.length === 2) return `(${parts[0]}) || (${parts[1]})`;
+    if (parts.length === 1) return parts[0];
+  }
+  return null;
+}
+
+ipcMain.handle('icinga:summary', async () => {
+  const { icinga } = loadConfig();
+  if (!icinga || !icinga.url || !icinga.username) return { ok: false, error: 'Icinga no configurado' };
+  try {
+    const res = await httpRequestWithRetry({
+      url: `${icinga.url.replace(/\/$/, '')}/v1/status/CIB`,
+      headers: icingaAuthHeader(icinga),
+      rejectUnauthorized: icinga.verifySsl !== false,
+    });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
+    const cib = res.body && res.body.results && res.body.results[0] && res.body.results[0].status;
+    if (!cib) return { ok: false, error: 'Respuesta CIB inesperada' };
+    return {
+      ok: true,
+      summary: {
+        hostsUp: cib.num_hosts_up || 0,
+        hostsDown: cib.num_hosts_down || 0,
+        hostsUnreachable: cib.num_hosts_unreachable || 0,
+        hostsAcknowledged: cib.num_hosts_acknowledged || 0,
+        hostsInDowntime: cib.num_hosts_in_downtime || 0,
+        servicesOk: cib.num_services_ok || 0,
+        servicesWarning: cib.num_services_warning || 0,
+        servicesCritical: cib.num_services_critical || 0,
+        servicesUnknown: cib.num_services_unknown || 0,
+        servicesAcknowledged: cib.num_services_acknowledged || 0,
+        servicesInDowntime: cib.num_services_in_downtime || 0,
+      },
+    };
+  } catch (e) {
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
+  }
+});
+
+// Problemas actuales de hosts o servicios, con filtro por equipo opcional.
+// handled = acknowledgement o downtime activo (mismo criterio que Icingaweb).
+ipcMain.handle('icinga:problems', async (event, { type, team }) => {
+  const { icinga } = loadConfig();
+  if (!icinga || !icinga.url || !icinga.username) return { ok: false, error: 'Icinga no configurado' };
+  const isServices = type === 'services';
+  const baseFilter = isServices ? 'service.state != 0' : 'host.state != 0';
+  const teamFilter = icingaTeamFilter(icinga, team);
+  const filter = teamFilter ? `(${baseFilter}) && (${teamFilter})` : baseFilter;
+  const attrs = isServices
+    ? ['display_name', 'host_name', 'state', 'acknowledgement', 'downtime_depth', 'last_check_result', 'last_state_change']
+    : ['display_name', 'name', 'state', 'acknowledgement', 'downtime_depth', 'last_check_result', 'last_state_change'];
+  try {
+    const res = await httpRequestWithRetry({
+      url: `${icinga.url.replace(/\/$/, '')}/v1/objects/${isServices ? 'services' : 'hosts'}`,
+      method: 'POST',
+      headers: { ...icingaAuthHeader(icinga), 'X-HTTP-Method-Override': 'GET', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filter, attrs }),
+      rejectUnauthorized: icinga.verifySsl !== false,
+      timeoutMs: 30000,
+    });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
+    if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body && res.body.status)}` };
+    const problems = ((res.body && res.body.results) || []).map((r) => {
+      const a = r.attrs || {};
+      return {
+        name: isServices ? `${a.display_name}` : (a.display_name || a.name),
+        host: isServices ? a.host_name : (a.name || a.display_name),
+        state: a.state, // hosts: 1=DOWN 2=UNREACHABLE · services: 1=WARN 2=CRIT 3=UNKNOWN
+        handled: (a.acknowledgement || 0) > 0 || (a.downtime_depth || 0) > 0,
+        output: (a.last_check_result && a.last_check_result.output) || '',
+        since: a.last_state_change || null,
+      };
+    });
+    // Peores primero: servicios CRIT(2) > UNKNOWN(3) > WARN(1); no-handled primero.
+    const sevRank = (p) => (isServices ? ({ 2: 0, 3: 1, 1: 2 })[p.state] ?? 3 : p.state === 1 ? 0 : 1);
+    problems.sort((x, y) => (x.handled - y.handled) || (sevRank(x) - sevRank(y)) || (y.since - x.since));
+    return { ok: true, problems, filterApplied: teamFilter || null };
+  } catch (e) {
+    return isNetworkErrorException(e) ? networkErrorResponse(e) : { ok: false, error: e.message };
+  }
+});
+
 ipcMain.handle('vault:isUnlocked', async () => {
   return { unlocked: isVaultUnlocked() };
+});
+
+// ── Gestión del vault (pantalla Vault del renderer) ──────────────────────
+
+// Bloquear a demanda: borra la clave derivada y el contenido descifrado de
+// memoria. El archivo en disco no se toca (ya está cifrado). Tras esto,
+// loadConfig() vuelve a devolver defaults y cualquier operación que
+// necesite credenciales fallará hasta un nuevo unlock — el renderer es
+// responsable de parar sus pollers ANTES de llamar aquí y de volver al gate.
+// Nota: las conexiones SSH ya establecidas siguen vivas (el canal no
+// necesita releer el secreto), por eso el renderer avisa si las hay.
+ipcMain.handle('vault:lock', async () => {
+  vaultKeyCache = null;
+  vaultDataCache = null;
+  return { ok: true };
+});
+
+// Cambiar la Master Password: exige la actual (verificada re-derivando la
+// clave contra el salt vigente y comparándola en tiempo constante con la
+// clave en memoria), y re-cifra el vault con salt nuevo + clave nueva.
+ipcMain.handle('vault:changePassword', async (event, { currentPassword, newPassword }) => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  if (!newPassword || newPassword.length < 8) {
+    return { ok: false, error: 'New master password must be at least 8 characters' };
+  }
+  try {
+    const currentKey = crypto.pbkdf2Sync(currentPassword || '', Buffer.from(vaultSaltHex, 'hex'), PBKDF2_ITERATIONS, 32, 'sha256');
+    if (!crypto.timingSafeEqual(currentKey, vaultKeyCache)) {
+      return { ok: false, error: 'Current master password is incorrect' };
+    }
+    // Salt nuevo SIEMPRE al cambiar la contraseña — reutilizar el salt viejo
+    // dejaría la nueva clave vinculada a material anterior sin necesidad.
+    const newSalt = crypto.randomBytes(16);
+    const newKey = crypto.pbkdf2Sync(newPassword, newSalt, PBKDF2_ITERATIONS, 32, 'sha256');
+    const prevSalt = vaultSaltHex;
+    const prevKey = vaultKeyCache;
+    vaultSaltHex = newSalt.toString('hex');
+    vaultKeyCache = newKey;
+    const res = persistVault(); // escritura atómica: o queda el vault nuevo o el viejo intacto
+    if (!res.ok) {
+      // Si el disco falló, revertimos la clave en memoria para que siga
+      // siendo coherente con el archivo que realmente quedó en disco (el viejo).
+      vaultSaltHex = prevSalt;
+      vaultKeyCache = prevKey;
+      return { ok: false, error: `Could not persist vault: ${res.error}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Inventario del vault para la pantalla de gestión — SOLO metadata y
+// contadores, jamás secretos. Todo sale del contenido real descifrado y del
+// propio archivo en disco.
+ipcMain.handle('vault:stats', async () => {
+  if (!isVaultUnlocked()) return { ok: false, error: 'Vault is locked' };
+  const d = vaultDataCache;
+  let file = null;
+  try {
+    const st = fs.statSync(VAULT_PATH);
+    file = { path: VAULT_PATH, sizeBytes: st.size, modifiedAt: st.mtime.toISOString() };
+  } catch (e) { /* el vault recién creado en memoria podría no estar aún en disco */ }
+  const sessions = d.ctSessions || [];
+  return {
+    ok: true,
+    stats: {
+      crypto: { cipher: 'AES-256-GCM', kdf: `PBKDF2-SHA256 (${PBKDF2_ITERATIONS.toLocaleString('en-US')} iterations)` },
+      file,
+      contents: {
+        jiraConfigured: !!(d.jira && d.jira.url),
+        awxConfigured: !!(d.awx && d.awx.url),
+        smtpConfigured: !!(d.smtp && d.smtp.host),
+        sshSessions: sessions.length,
+        sshSessionsMissingSecret: sessions.filter((s) => !s.secret).length,
+        macros: (d.ctMacros || []).length,
+        automationTemplates: (d.automationTemplates || []).length,
+        ticketLinks: Object.keys(d.ticketLinks || {}).length,
+        pendingAttachments: (d.pendingAttachments || []).length,
+        favoriteTemplates: (d.favoriteTemplates || []).length,
+        customCredentials: (d.customCredentials || []).length,
+      },
+    },
+  };
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1303,7 +1777,7 @@ ipcMain.handle('corexterm:connect', async (event, { sessionId, terminalId, cols,
     sshConn.shell({ term: 'xterm-256color', cols: cols || 80, rows: rows || 24 }, (err, stream) => {
       if (err) {
         activeTerminals.delete(terminalId);
-        event.sender.send('corexterm:error', { terminalId, error: err.message });
+        sendToRenderer('corexterm:error', { terminalId, error: err.message });
         return;
       }
       const entry = activeTerminals.get(terminalId);
@@ -1311,10 +1785,10 @@ ipcMain.handle('corexterm:connect', async (event, { sessionId, terminalId, cols,
       entry.kind = 'ssh';
 
       stream.on('data', (data) => {
-        event.sender.send('corexterm:data', { terminalId, data: data.toString('utf8') });
+        sendToRenderer('corexterm:data', { terminalId, data: data.toString('utf8') });
       });
       stream.on('close', () => {
-        event.sender.send('corexterm:closed', { terminalId });
+        sendToRenderer('corexterm:closed', { terminalId });
         activeTerminals.delete(terminalId);
       });
     });
@@ -1343,10 +1817,10 @@ ipcMain.handle('corexterm:connectLocal', async (event, { terminalId, cols, rows 
     activeTerminals.set(terminalId, { ptyProcess, kind: 'local' });
 
     ptyProcess.onData((data) => {
-      event.sender.send('corexterm:data', { terminalId, data });
+      sendToRenderer('corexterm:data', { terminalId, data });
     });
     ptyProcess.onExit(() => {
-      event.sender.send('corexterm:closed', { terminalId });
+      sendToRenderer('corexterm:closed', { terminalId });
       activeTerminals.delete(terminalId);
     });
 
@@ -1766,6 +2240,7 @@ ipcMain.handle('jira:listTransitions', async (event, { key }) => {
       headers: jiraAuthHeader(jira),
       rejectUnauthorized: jira.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true, transitions: (res.body && res.body.transitions) || [] };
   } catch (e) {
@@ -1790,6 +2265,7 @@ ipcMain.handle('jira:doTransition', async (event, { key, transitionId }) => {
       body: { transition: { id: numericId } },
       rejectUnauthorized: jira.verifySsl !== false,
     });
+    if (res.status === 401 || res.status === 403) return authErrorResponse(res.status);
     if (res.status >= 400) return { ok: false, error: `HTTP ${res.status}: ${JSON.stringify(res.body)}` };
     return { ok: true };
   } catch (e) {

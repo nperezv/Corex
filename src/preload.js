@@ -65,6 +65,21 @@ contextBridge.exposeInMainWorld('corexAPI', {
   vaultExists: () => ipcRenderer.invoke('vault:exists'),
   vaultUnlock: (masterPassword) => ipcRenderer.invoke('vault:unlock', { masterPassword }),
   vaultIsUnlocked: () => ipcRenderer.invoke('vault:isUnlocked'),
+  vaultLock: () => ipcRenderer.invoke('vault:lock'),
+  vaultChangePassword: (currentPassword, newPassword) => ipcRenderer.invoke('vault:changePassword', { currentPassword, newPassword }),
+  vaultStats: () => ipcRenderer.invoke('vault:stats'),
+  jiraMyself: () => ipcRenderer.invoke('jira:myself'),
+  onForceLock: (callback) => {
+    const listener = (event, payload) => callback(payload);
+    ipcRenderer.on('corex:force-lock', listener);
+  },
+  icingaSummary: () => ipcRenderer.invoke('icinga:summary'),
+  icingaProblems: (type, team) => ipcRenderer.invoke('icinga:problems', { type, team }),
+  credsList: () => ipcRenderer.invoke('creds:list'),
+  credsSave: (cred) => ipcRenderer.invoke('creds:save', cred),
+  credsDelete: (id) => ipcRenderer.invoke('creds:delete', { id }),
+  credsReveal: (id) => ipcRenderer.invoke('creds:reveal', { id }),
+  getLogDir: () => ipcRenderer.invoke('app:getLogDir'),
   corextermListSessions: () => ipcRenderer.invoke('corexterm:listSessions'),
   corextermSaveSession: (session) => ipcRenderer.invoke('corexterm:saveSession', { session }),
   corextermDeleteSession: (id) => ipcRenderer.invoke('corexterm:deleteSession', { id }),

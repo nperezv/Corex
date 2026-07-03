@@ -1,22 +1,30 @@
 {
   "name": "corex",
   "version": "0.1.0",
-  "description": "COREX — panel unificado de operaciones: Jira + AWX + Git",
+  "description": "COREX \u2014 panel unificado de operaciones: Jira + AWX + Git",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node tests/main-load.js && node tests/smoke.js"
   },
   "author": "",
   "license": "ISC",
   "build": {
     "appId": "com.corex.app",
     "productName": "COREX",
-    "win": { "icon": "assets/icon.ico" },
-    "linux": { "icon": "assets/icon.png" },
-    "mac": { "icon": "assets/icon.png" }
+    "win": {
+      "icon": "assets/icon.ico"
+    },
+    "linux": {
+      "icon": "assets/icon.png"
+    },
+    "mac": {
+      "icon": "assets/icon.png"
+    }
   },
   "devDependencies": {
-    "electron": "^30.0.0"
+    "electron": "^30.0.0",
+    "jsdom": "^24.0.0"
   },
   "dependencies": {
     "nodemailer": "^6.9.13",

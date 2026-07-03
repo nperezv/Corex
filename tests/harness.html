@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --font-ui: -apple-system, 'Segoe UI', 'Inter', Roboto, 'Helvetica Neue', Arial, sans-serif; --font-mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, monospace; }
+  html, body, #app { height: 100%; background: #0a0e15; color: #c8d0d8; font-family: var(--font-ui); }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #1b2530; border-radius: 3px; }
+  input, textarea, select, button { font-family: var(--font-ui); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// ── Stubs previos a app.js ──
+window.Terminal = function Terminal() {
+  this.open = () => {}; this.write = () => {}; this.onData = () => {};
+  this.onResize = () => {}; this.loadAddon = () => {}; this.dispose = () => {}; this.focus = () => {};
+  this.cols = 80; this.rows = 24;
+};
+window.FitAddon = { FitAddon: function FitAddon() { this.fit = () => {}; } };
+
+const ok = (extra) => Promise.resolve(Object.assign({ ok: true }, extra));
+const ISSUES = [
+  { key: 'ITSD-1234', _sla: { ongoing: { name: 'Time to resolution', remainingMillis: 12*60000, breached: false, goalMillis: 4*3600000 }, anyBreached: false }, fields: { summary: 'Payments API failing on prod', priority: { name: 'Highest' }, status: { name: 'Waiting for ops', statusCategory: { key: 'indeterminate' } }, components: [{ name: 'Payments API' }], issuetype: { name: 'Incident' }, updated: new Date().toISOString() } },
+  { key: 'ITSD-1235', _sla: { ongoing: { name: 'Time to resolution', remainingMillis: 2*3600000, breached: false, goalMillis: 8*3600000 }, anyBreached: false }, fields: { summary: 'Auth service intermittent errors', priority: { name: 'High' }, status: { name: 'In Progress', statusCategory: { key: 'indeterminate' } }, components: [{ name: 'Auth Service' }], issuetype: { name: 'Incident' }, updated: new Date().toISOString() } },
+  { key: 'ITSD-1236', /*svc*/ _sla: { ongoing: { name: 'Time to first response', remainingMillis: 45*60000, breached: false, goalMillis: 3600000 }, anyBreached: false }, fields: { summary: 'High latency reported by users', priority: { name: 'High' }, status: { name: 'Open', statusCategory: { key: 'new' } }, issuetype: { name: 'Problem' }, components: [{ name: 'Web Frontend' }], updated: new Date().toISOString() } },
+  { key: 'ITSD-1237', _sla: { ongoing: null, anyBreached: true }, fields: { summary: 'Slow DB queries detected', priority: { name: 'Medium' }, status: { name: 'Open', statusCategory: { key: 'new' } }, issuetype: { name: 'Task' }, components: [{ name: 'Database' }], updated: new Date().toISOString() } },
+  { key: 'ITSD-1238', fields: { summary: 'Disk space increasing', priority: { name: 'Low' }, status: { name: 'Open' }, issuetype: { name: 'Task' }, updated: new Date().toISOString() } },
+];
+window.corexAPI = new Proxy({
+  vaultIsUnlocked: () => Promise.resolve({ unlocked: true }),
+  vaultExists: () => Promise.resolve({ exists: true }),
+  getConfig: () => Promise.resolve({ jira: { url: 'https://jira.example.com', email: 'nelson@example.com', token: 'x' }, awx: { url: 'https://awx.example.com', token: 'x' }, smtp: {}, lang: 'en', icinga: { url: 'https://icg:5665', username: 'corex', password: 'x', webUrl: 'https://icg/icingaweb2', linuxFilter: '"linux" in host.groups' }, profile: { team: 'linux' } }),
+  ticketLinksGet: () => Promise.resolve({ 'ITSD-1234': { templateId: 5, templateName: 'restart-service-linux', linkedAt: Date.now() } }),
+  favoritesGet: () => Promise.resolve([7]),
+  templateUsageGet: () => Promise.resolve({ 5: 8, 7: 3 }),
+  ctSessionsGet: () => ok({ sessions: [
+    { id: 's1', name: 'app-prod-01', host: '10.0.0.11', port: 22, username: 'nelson', authType: 'password', folder: 'Production', color: '#22c55e', hasTunnel: false, tunnel: null },
+    { id: 's2', name: 'db-prod-01', host: '10.0.0.12', port: 22, username: 'nelson', authType: 'key', folder: 'Production', color: null, hasTunnel: false, tunnel: null },
+    { id: 's3', name: 'staging-app', host: '10.1.0.11', port: 22, username: 'deploy', authType: 'password', folder: 'Staging', color: null, hasTunnel: true, tunnel: { host: 'bastion', port: 22, username: 'jump', authType: 'key' } },
+  ] }),
+  corextermListSessions: () => window.corexAPI.ctSessionsGet(),
+  ctMacrosGet: () => ok({ macros: [{ id: 'm1', name: 'top + df', steps: [] }] }),
+  automationTemplatesGet: () => ok({ templates: [] }),
+  pendingAttachmentsGet: () => ok({ pending: [] }),
+  jiraSearchMyIssues: () => ok({ issues: ISSUES, slaAvailable: true }),
+  jiraMyself: () => ok({ me: { displayName: 'Nelson Perez', emailAddress: 'nelson@example.com', accountId: 'x', avatarDataUrl: null } }),
+  dashboardGetMetrics: () => ok({
+    cpu: { load: 34, user: 22, system: 8, cores: 8 },
+    mem: { used: 9.8e9, total: 16e9 },
+    temp: { main: 52 },
+    battery: { hasBattery: false },
+    disks: [{ mount: '/', use: 42, used: 4.2e10, size: 1e11 }, { mount: '/data', use: 67, used: 6.7e10, size: 1e11 }],
+    net: { rx_sec: 1.2e5, tx_sec: 4.4e4 },
+    topProcesses: [{ name: 'node', cpu: 3.2, mem: 2.1 }, { name: 'chrome', cpu: 8.4, mem: 12.7 }],
+  }),
+  awxListTemplates: () => ok({ templates: [
+    { id: 5, name: 'restart-service-linux', description: 'Restart a systemd unit', job_type: 'run' },
+    { id: 7, name: 'collect-diagnostics', description: 'Gather logs + sosreport', job_type: 'run' },
+    { id: 9, name: 'patch-linux', description: 'Apply security patches', job_type: 'run' },
+  ] }),
+  awxRecentJobs: () => ok({ jobs: [
+    { id: 9281, name: 'restart-service-linux', status: 'successful', finished: new Date().toISOString() },
+    { id: 9279, name: 'patch-linux', status: 'failed', finished: new Date().toISOString() },
+    { id: 9278, name: 'collect-diagnostics', status: 'successful', finished: new Date().toISOString() },
+    { id: 9277, name: 'db-health-check', status: 'successful', finished: new Date().toISOString() },
+  ] }),
+  vaultStats: () => ok({ stats: {
+    crypto: { cipher: 'AES-256-GCM', kdf: 'PBKDF2-SHA256 (200,000 iterations)' },
+    file: { path: '/home/nelson/.config/corex/vault.json', sizeBytes: 6144, modifiedAt: new Date().toISOString() },
+    contents: { jiraConfigured: true, awxConfigured: true, smtpConfigured: false, sshSessions: 3, sshSessionsMissingSecret: 1, macros: 1, automationTemplates: 2, ticketLinks: 1, pendingAttachments: 0, favoriteTemplates: 1 },
+  } }),
+  setConfig: async function(partial) {
+    const cfg = await this.getConfig();
+    return Object.assign({}, cfg, window.__cfgExtra || {}, partial, (window.__cfgExtra = Object.assign(window.__cfgExtra || {}, partial)));
+  },
+  icingaSummary: () => ok({ summary: { hostsUp: 9713, hostsDown: 147, hostsUnreachable: 0, hostsAcknowledged: 140, hostsInDowntime: 7, servicesOk: 31649, servicesWarning: 70, servicesCritical: 2, servicesUnknown: 0, servicesAcknowledged: 1, servicesInDowntime: 0 } }),
+  icingaProblems: (t) => ok({ problems: t === 'hosts' ? [
+    { name: 'paungiprapipa01.axadmin.net', host: 'paungiprapipa01.axadmin.net', state: 1, handled: true, output: 'CRITICAL - Socket timeout', since: Date.now()/1000 - 86400 },
+  ] : [
+    { name: 'chrony', host: 'dc02prdpbhmc01b.oec.omnitracs.com', state: 2, handled: false, output: 'CRITICAL - Server is not synchronised with the ntp server', since: Date.now()/1000 - 3600 },
+    { name: 'disk', host: 'jira-db05-p.axadmin.net', state: 1, handled: false, output: 'DISK WARNING - free space: /u00 5630 MB (4.86% inode=87%)', since: Date.now()/1000 - 7200 },
+  ] }),
+  credsList: () => ok({ credentials: window.__creds || [] }),
+  credsSave: (c) => { window.__creds = window.__creds || []; if (c.id) { const e = window.__creds.find(x=>x.id===c.id); Object.assign(e, c, {secretLength: (c.secret||'x').length}); } else { window.__creds.push({ ...c, id: 'cred-1', secretLength: (c.secret||'').length }); } return ok({}); },
+  credsDelete: (id) => { window.__creds = (window.__creds||[]).filter(c=>c.id!==id.id && c.id!==id); return ok({}); },
+  credsReveal: (id) => ok({ secret: 'sup3r-s3cret!' }),
+  getLogDir: () => Promise.resolve('/home/nelson/.config/corex/logs'),
+  logInfo: () => {}, logError: () => {},
+}, {
+  get(t, p) {
+    if (p in t) return t[p];
+    return () => Promise.resolve({ ok: true, exists: true, unlocked: true, sessions: [], macros: [], templates: [], pending: [], issues: [], jobs: [], entries: [] });
+  },
+});
+</script>
+<script src="../src/i18n.js"></script>
+<script src="../src/app.js"></script>
+<script>
+// ── Arranque del harness ──
+window.__ready = (async () => {
+  state.vaultUnlocked = true;
+  state.config = await window.corexAPI.getConfig();
+  state.inboxIssues = ISSUES;
+  state.slaAvailable = true;
+  state.ticketLinks = await window.corexAPI.ticketLinksGet();
+  state.awxRecentJobs = (await window.corexAPI.awxRecentJobs()).jobs;
+  state.awxTemplates = (await window.corexAPI.awxListTemplates()).templates;
+  state.ctSessions = (await window.corexAPI.ctSessionsGet()).sessions;
+  state.jiraMyself = (await window.corexAPI.jiraMyself()).me;
+  state.vaultStats = (await window.corexAPI.vaultStats()).stats;
+  state.hwMetrics = await window.corexAPI.dashboardGetMetrics();
+  state.hwHistory = Array.from({ length: 40 }, (_, i) => ({
+    t: Date.now() - (40 - i) * 3000,
+    cpuUser: 18 + Math.sin(i / 4) * 10 + (i % 3),
+    cpuSystem: 6,
+    memUsed: 9.5e9 + Math.sin(i / 6) * 5e8,
+    memTotal: 16e9,
+  }));
+  window.__setView = (v) => { state.view = v; renderApp(); };
+  window.__setView('inbox');
+  return true;
+})();
+</script>
+</body>
+</html>

@@ -41,14 +41,24 @@
       src: url('vendor/fonts/ibm-plex-mono-latin-700-normal.woff2') format('woff2');
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body, #app { height: 100%; background: #0a0b0d; color: #c8d0d8; font-family: 'IBM Plex Mono', monospace; }
+    /* Fondo base migrado a la paleta Cockpit (#0a0e15) — debe coincidir con
+       CX.bgApp en app.js para que no haya "flashes" de otro color entre el
+       gate del vault y la app, ni bordes visibles al hacer scroll elástico. */
+    /* Tipografía dual como el mockup: sans (stack de sistema, look Inter)
+       para toda la UI, y IBM Plex Mono reservada para código, terminal,
+       claves de ticket y valores numéricos (clase .cx-mono o font-family
+       explícita en el elemento). */
+    :root {
+      --font-ui: -apple-system, 'Segoe UI', 'Inter', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, monospace;
+    }
+    html, body, #app { height: 100%; background: #0a0e15; color: #c8d0d8; font-family: var(--font-ui); }
+    .cx-mono { font-family: var(--font-mono); }
     ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: #0a0b0d; }
-    ::-webkit-scrollbar-thumb { background: #22252a; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #2e3238; }
-    input, textarea, select, button { font-family: 'IBM Plex Mono', monospace; }
-
-
+    ::-webkit-scrollbar-track { background: #0a0e15; }
+    ::-webkit-scrollbar-thumb { background: #1b2530; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #26313d; }
+    input, textarea, select, button { font-family: var(--font-ui); }
   </style>
 </head>
 <body>
